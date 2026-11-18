@@ -1,0 +1,18 @@
+*.iml
+.gradle/
+/local.properties
+/.idea/
+.DS_Store
+/build/
+/captures
+.externalNativeBuild
+.cxx/
+local.properties
+# H-10 fix: never commit signing secrets
+/gradle.properties
+/keystore/
+*.jks
+*.keystore
+*.apk
+*.ap_
+app/.kotlin/

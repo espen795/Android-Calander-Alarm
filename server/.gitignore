@@ -1,0 +1,31 @@
+# Environment variables & secrets
+.env
+.env.local
+.env.*.local
+
+# Runtime data (tokens, logs, config) — NEVER commit
+# Owner 10001:10001 on host so the non-root container can write
+data/*
+!data/README.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Docker
+docker-compose.override.yml

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- M-04 fix: Restrict FileProvider to specific subdirectories (not the whole cache) -->
+<paths>
+    <cache-path name="apk_updates" path="apk_updates/" />
+    <cache-path name="logs" path="logs/" />
+</paths>

@@ -1,0 +1,40 @@
+services:
+  calendar-alarm-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: calendar-alarm-api
+    restart: unless-stopped
+    # H4 hardening: non-root user (10001), read-only rootfs, writable tmpfs for /tmp.
+    # Only the isolated ./data dir is mounted.
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    environment:
+      - CALALARM_DEVICE_TOKEN=${CALALARM_DEVICE_TOKEN}
+      - CALALARM_WORKSPACE=/data
+    volumes:
+      - ./data:/data:rw
+    networks:
+      - proxy
+    # No `ports:` section on purpose: the container is reachable only via the
+    # internal `proxy` network through the reverse proxy below.
+    # NOTE: replace the traefik.* labels with your own reverse-proxy routing
+    # (the labels below are an example for a Traefik-based edge).
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+      - "traefik.http.routers.calendar-alarm-api.rule=Host(`${CALALARM_API_HOST:?set CALALARM_API_HOST in .env}`)"
+      - "traefik.http.routers.calendar-alarm-api.entrypoints=websecure"
+      - "traefik.http.routers.calendar-alarm-api.tls=true"
+      - "traefik.http.routers.calendar-alarm-api.priority=25"
+      - "traefik.http.services.calendar-alarm-api.loadbalancer.server.port=8100"
+      # Rate limiting at the proxy level (defense in depth — the app also limits at 10/min)
+      - "traefik.http.middlewares.calendar-alarm-api-ratelimit.ratelimit.average=20"
+      - "traefik.http.middlewares.calendar-alarm-api-ratelimit.ratelimit.burst=30"
+      - "traefik.http.routers.calendar-alarm-api.middlewares=calendar-alarm-api-ratelimit"
+
+networks:
+  proxy:
+    external: true

@@ -1,0 +1,21 @@
+# secrets / signing — never commit
+.env
+*.jks
+*.keystore
+*.p12
+gradle.properties
+local.properties
+server/data/*
+!server/data/README.md
+# build output
+.gradle/
+build/
+dist/
+*.apk
+*.aab
+.kotlin/
+__pycache__/
+.pytest_cache/
+.idea/
+*.iml
+.DS_Store

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- No cleartext traffic allowed anywhere -->
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <!--
+        NOTE: Certificate pinning is implemented manually in CertificatePinner
+        (io.github.calendaralarm.sync.CertificatePinner) because Ktor's CIO engine
+        does NOT use Android Network Security Config. Having <pin-set> here would
+        conflict with the custom TrustManager and cause:
+        "Domain specific configurations require that hostname aware
+         checkServerTrusted(X509Certificate[], String, String) is used"
+        So we intentionally do NOT define pins here.
+    -->
+</network-security-config>

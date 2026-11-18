@@ -1,0 +1,48 @@
+{
+  "rules": [
+    {
+      "id": "office",
+      "name": "Kantoor dag",
+      "time": "07:00",
+      "keywords": [
+        "kantoor",
+        "office",
+        "standup",
+        "meeting op locatie",
+        "op kantoor",
+        "naar kantoor",
+        "bureel",
+        "workplace",
+        "fysiek aanwezig",
+        "aanwezig op kantoor"
+      ]
+    },
+    {
+      "id": "home",
+      "name": "Thuiswerk dag",
+      "time": "08:30",
+      "keywords": [
+        "thuis",
+        "home office",
+        "thuiswerken",
+        "homeoffice",
+        "remote",
+        "thuiswerk",
+        "werken vanuit huis"
+      ]
+    },
+    {
+      "id": "off",
+      "name": "Vrije dag",
+      "time": "09:00",
+      "keywords": [
+        "vrij",
+        "verlof",
+        "vakantie",
+        "ziek"
+      ]
+    }
+  ],
+  "default_rule_id": "home",
+  "weekend_rule_id": ""
+}

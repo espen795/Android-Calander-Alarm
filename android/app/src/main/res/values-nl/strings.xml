@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Calendar Alarm</string>
+    <string name="alarm_set_notification_title">Alarm set</string>
+    <string name="alarm_set_notification_text">%1$s hour %2$s minute</string>
+    <string name="sync_failed_title">⚠️ Calendar Alarm sync failed</string>
+    <string name="update_available_title">Update available</string>
+    <string name="update_available_text">Version %1$s is available. Tap to update.</string>
+    <string name="channel_alarms">Alarms</string>
+    <string name="channel_updates">Updates</string>
+    <string name="channel_timer">Timer</string>
+    <string name="alarm_ringing_title">⏰ %1$s hour %2$s minute</string>
+    <string name="alarm_ringing_text">Alarm active</string>
+    <string name="action_snooze">Snooze 5 min</string>
+    <string name="action_dismiss">Dismiss</string>
+    <string name="update_ready_title">Calendar Alarm update ready</string>
+    <string name="update_ready_text">Version %1$s is verified. Tap to install.</string>
+    <string name="widget_description">Live time, date and next alarm</string>
+</resources>

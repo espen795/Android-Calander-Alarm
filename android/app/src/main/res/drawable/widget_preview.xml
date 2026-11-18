@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Dark background -->
+    <path
+        android:fillColor="#121212"
+        android:pathData="M8,8 Q8,0 16,0 L92,0 Q100,0 100,8 L100,100 Q100,108 92,108 L16,108 Q8,108 8,100 Z" />
+    <!-- White time text -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M30,40 L30,60 L35,60 L35,48 L42,48 Q48,48 48,42 Q48,36 42,36 L35,36 L35,40 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M52,36 L62,36 Q68,36 68,42 Q68,48 62,48 L57,48 L57,60 L52,60 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M72,36 L82,36 L82,60 L77,60 L77,40 L72,40 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M86,36 L96,36 L96,60 L91,60 L91,40 L86,40 Z" />
+    <!-- Divider lijn -->
+    <path
+        android:fillColor="#80FFFFFF"
+        android:pathData="M35,66 L73,66 L73,68 L35,68 Z" />
+    <!-- Small date text (simplified) -->
+    <path
+        android:fillColor="#CCCCCC"
+        android:pathData="M30,76 L35,76 L35,82 L30,82 Z" />
+    <path
+        android:fillColor="#CCCCCC"
+        android:pathData="M38,76 L48,76 Q52,76 52,79 Q52,82 48,82 L43,82 L43,78 L48,78 Q49,78 49,79 Q49,80 48,80 L38,80 Z" />
+</vector>

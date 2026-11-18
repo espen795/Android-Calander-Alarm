@@ -1,0 +1,64 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# NOTE on action pinning: all `uses:` below are pinned to major tags (e.g. @v4).
+# For stronger supply-chain protection, pin each action to its full commit SHA
+# (e.g. actions/checkout@<40-char-sha>) — run `git ls-remote` on the action repo
+# or use a tool like `zizmor`/`action-pin` to resolve SHAs, and update them via
+# Dependabot. Tag pinning + Dependabot updates is the minimum acceptable level.
+#
+# NOTE on gitleaks-action: GITLEAKS_LICENSE is only required when scanning
+# organization repositories with gitleaks' commercial features; for personal
+# repos / public repos the community build works without a license, so no
+# license env is set here.
+
+jobs:
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Repo hygiene check
+        run: tools/sanitize-check.sh
+
+  server:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: python -m pytest -q
+
+  android:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+      - run: cp gradle.properties.template gradle.properties
+      - run: ./gradlew --no-configuration-cache :app:testDebugUnitTest :app:assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- M-04 fix: correct filenames -->
+<full-backup-content>
+    <exclude domain="sharedpref" path="calendar_alarm_secure_prefs.xml" />
+    <exclude domain="sharedpref" path="calendar_alarm_store.xml" />
+</full-backup-content>
