@@ -1,0 +1,2 @@
+# Truncated example token in docs of the v2.6.13 commit (false positive, fixed in v2.8.0)
+0a2599a99026b41d5fab60f5279a88960201527c:docs/BACKEND.md:generic-api-key:154

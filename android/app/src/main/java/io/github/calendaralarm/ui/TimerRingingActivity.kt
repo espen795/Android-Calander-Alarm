@@ -1,7 +1,5 @@
 package io.github.calendaralarm.ui
 
-import android.app.KeyguardManager
-import android.content.Context
 import android.os.Build
 import android.os.Bundle
 import android.view.KeyEvent
@@ -31,7 +29,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.calendaralarm.data.AppLogger
-import io.github.calendaralarm.data.TimerAlarmHelper
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
+import io.github.calendaralarm.service.TimerRingService
 import io.github.calendaralarm.ui.theme.CalendarAlarmTheme
 import io.github.calendaralarm.ui.theme.CalRed
 
@@ -42,7 +42,7 @@ private const val TAG = "TimerRingingActivity"
  *
  * Shows when the countdown timer finishes:
  * - Full-screen, over lock screen, turns screen on
- * - Shows "00:00", "⏰ Timer afgelopen", and a large "Stoppen" button
+ * - Shows "00:00", "⏰ Timer finished", and a large "Stop" button
  * - Stop button stops TimerAlarmHelper and finishes the activity
  * - Back button also stops the alarm
  * - FLAG_KEEP_SCREEN_ON while visible
@@ -58,19 +58,14 @@ class TimerRingingActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true)
             setTurnScreenOn(true)
-            val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
-            keyguardManager.requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
-                override fun onDismissSucceeded() {
-                    AppLogger.i(TAG, "Timer keyguard dismissed successfully")
-                }
-            })
+            // v2.7.0: NO requestDismissKeyguard — that asks for unlocking (same fix as
+            // AlarmRingingActivity v2.6.10). Showing over the lock screen is enough.
         }
 
         @Suppress("DEPRECATION")
         window.addFlags(
             WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
             or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
-            or WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD
             or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
             or WindowManager.LayoutParams.FLAG_FULLSCREEN
             or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
@@ -96,6 +91,31 @@ class TimerRingingActivity : ComponentActivity() {
 
         // v2.5.3 PM fix M-01: FLAG_SECURE — consistent met AlarmRingingActivity (M-08)
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+
+        // v2.7.0: No ghost screen — when nothing is ringing (anymore), close directly.
+        if (!TimerRingService.ringing.value) {
+            AppLogger.i(TAG, "No active timer alarm — activity closes directly")
+            finish()
+            return
+        }
+
+        // v2.7.0: back = stop (via dispatcher instead of deprecated onBackPressed)
+        onBackPressedDispatcher.addCallback(this, object : androidx.activity.OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                AppLogger.i(TAG, "Back — stop timer")
+                stopAndFinish()
+            }
+        })
+
+        // v2.7.0: close as soon as ringing stops elsewhere (notification action, power button)
+        lifecycleScope.launch {
+            TimerRingService.ringing.collect { ringing ->
+                if (!ringing && !isFinishing) {
+                    AppLogger.i(TAG, "Ringing stopped — activity closes")
+                    finish()
+                }
+            }
+        }
 
         setContent {
             CalendarAlarmTheme(darkTheme = true) {
@@ -137,6 +157,12 @@ class TimerRingingActivity : ComponentActivity() {
 
         AppLogger.i(TAG, "dispatchKeyEvent: action=$action keyCode=$keyCode (${KeyEvent.keyCodeToString(keyCode)})")
 
+        // v2.7.0: volume-DOWN consumed so the button does not change the volume
+        if (action == KeyEvent.ACTION_DOWN &&
+            (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN)) {
+            return true
+        }
+
         if (action == KeyEvent.ACTION_UP) {
             // Any key stops the timer (except back which has its own handler)
             if (keyCode != KeyEvent.KEYCODE_BACK) {
@@ -149,25 +175,17 @@ class TimerRingingActivity : ComponentActivity() {
         return super.dispatchKeyEvent(event)
     }
 
-    /**
-     * v2.5.3: Back button = stop alarm (same as pressing Stoppen).
-     */
-    @Deprecated("Deprecated in Java")
-    override fun onBackPressed() {
-        AppLogger.i(TAG, "Back pressed — stopping timer alarm")
-        stopAndFinish()
-    }
-
     override fun onDestroy() {
-        // Safety: stop alarm if activity is destroyed without explicit action
-        AppLogger.i(TAG, "TimerRingingActivity onDestroy")
-        TimerAlarmHelper.stopSharedAlarm()
+        // v2.7.0: onDestroy no longer stops the sound. Ringing is owned by
+        // TimerRingService and only stops on an explicit action. Previously a
+        // second launch / rotation / system recreate of this activity stopped the sound silently.
+        AppLogger.i(TAG, "TimerRingingActivity onDestroy (ringing left untouched)")
         super.onDestroy()
     }
 
     private fun stopAndFinish() {
-        AppLogger.i(TAG, "Stop button pressed — stopping timer alarm")
-        TimerAlarmHelper.stopSharedAlarm()
+        AppLogger.i(TAG, "Stop — timer alarm off")
+        TimerRingService.stop(applicationContext)
         finish()
     }
 }
@@ -206,7 +224,7 @@ fun TimerRingingScreen(
             Spacer(modifier = Modifier.height(8.dp))
 
             Text(
-                text = "⏰ Timer afgelopen",
+                text = "⏰ Timer finished",
                 fontSize = 28.sp,
                 fontWeight = FontWeight.Medium,
                 color = Color(0xFF8E8E93)
@@ -222,13 +240,13 @@ fun TimerRingingScreen(
                     .padding(8.dp)
                     .height(64.dp)
             ) {
-                Text("Stoppen", fontSize = 22.sp)
+                Text("Stop", fontSize = 22.sp)
             }
 
             Spacer(modifier = Modifier.height(16.dp))
 
             Text(
-                text = "Or press the back button to stop",
+                text = "Or press a volume or power button",
                 fontSize = 12.sp,
                 color = Color(0xFF8E8E93).copy(alpha = 0.7f)
             )

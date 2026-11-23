@@ -26,18 +26,24 @@ class AlarmStoreTest {
 
     private lateinit var store: AlarmStore
 
+    // P1 #1: AlarmStore now uses device-protected storage — tests must clear DP prefs
+    private fun dpPrefs(context: Context) =
+        DeviceProtectedStorage.prefs(context, "calendar_alarm_store")
+
     @Before
     fun setUp() {
         val context = ApplicationProvider.getApplicationContext<Context>()
-        // Clear any existing prefs
+        // Clear any existing prefs (both CE and DP)
         context.getSharedPreferences("calendar_alarm_store", Context.MODE_PRIVATE)
             .edit().clear().commit()
+        dpPrefs(context).edit().clear().commit()
         store = AlarmStore(context)
     }
 
     @After
     fun tearDown() {
         store.removeAll()
+        dpPrefs(ApplicationProvider.getApplicationContext<Context>()).edit().clear().commit()
     }
 
     private fun createTestAlarm(
@@ -299,5 +305,77 @@ class AlarmStoreTest {
 
         assertNotNull(retrieved)
         assertEquals("Persisted alarm", retrieved!!.label)
+    }
+
+    // ============== P1 review#2: corruptie-afhandeling ==============
+
+    @Test
+    fun `b3 corrupt main key is quarantined once, after which the store accepts saves again`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val prefs = DeviceProtectedStorage.prefs(context, "calendar_alarm_store")
+        val corrupt = """{"1":{"id":1,"triggerAtMillis":123,"timeLabel":"07:00" """
+        prefs.edit().putString("alarms", corrupt).commit()
+
+        val s = AlarmStore(context)
+        // loadAll returns empty (fail-safe), but...
+        assertTrue(s.getAll().isEmpty())
+        // ...the raw blob is in quarantine (once — see B3)
+        val quarantined = prefs.getString(AlarmStore.KEY_ALARMS_QUARANTINE, null)
+        assertNotNull("corrupt blob must be quarantined", quarantined)
+        assertEquals(corrupt, quarantined)
+
+        // B3: repeated loads must NOT create extra quarantine copies
+        s.getAll(); s.getAll(); s.get(1)
+        val tsKeys = prefs.all.keys.filter { it.startsWith(AlarmStore.KEY_ALARMS_CORRUPT_PREFIX) }
+        assertTrue("B3: max 1-3 quarantine copies, was ${tsKeys.size}", tsKeys.size in 1..3)
+
+        // B3: after the quarantine (raw data is secured) persist may overwrite the main
+        // key again — otherwise ALL saves would remain permanently refused and the
+        // alarm chain breaks (AlarmManager is set, store is not).
+        s.save(createTestAlarm(id = 99))
+        val rawAfter = prefs.getString("alarms", null)
+        assertNotNull("B3: after quarantine a save must be allowed to write the main key again", rawAfter)
+        assertTrue("B3: new save is valid JSON with id=99", rawAfter!!.contains("\"id\":99"))
+        assertEquals(1, s.getAll().size)
+        assertEquals(99, s.getAll().first().id)
+        // The quarantine blob is kept for recovery/analysis
+        assertEquals(corrupt, prefs.getString(AlarmStore.KEY_ALARMS_QUARANTINE, null))
+    }
+
+    @Test
+    fun `p1 valid backup is used on corruption of the main key`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val prefs = DeviceProtectedStorage.prefs(context, "calendar_alarm_store")
+        // First a valid save → backup is written along
+        store.save(createTestAlarm(id = 1, label = "Backup alarm"))
+        val backup = prefs.getString(AlarmStore.KEY_ALARMS_BACKUP, null)
+        assertNotNull("on valid persist alarms_backup must be filled", backup)
+
+        // Corrupt the main key
+        prefs.edit().putString("alarms", "{kapot").commit()
+
+        val s = AlarmStore(context)
+        val all = s.getAll()
+        assertEquals("on corruption the backup must serve as source", 1, all.size)
+        assertEquals("Backup alarm", all.first().label)
+    }
+
+    @Test
+    fun `p1 onCorruption callback is called once per process`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val prefs = DeviceProtectedStorage.prefs(context, "calendar_alarm_store")
+        prefs.edit().putString("alarms", "{kapot").commit()
+
+        var calls = 0
+        val prev = AlarmStore.onCorruption
+        AlarmStore.onCorruption = { calls++ }
+        try {
+            val s = AlarmStore(context)
+            s.getAll()
+            s.getAll()
+            assertEquals("corruption callback may only fire 1× per process", 1, calls)
+        } finally {
+            AlarmStore.onCorruption = prev
+        }
     }
 }

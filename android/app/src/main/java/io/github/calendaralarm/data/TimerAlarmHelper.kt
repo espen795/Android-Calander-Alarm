@@ -97,32 +97,15 @@ class TimerAlarmHelper(private val context: Context) {
     }
 
     /**
-     * v2.6.8: Start ONLY vibration (no sound) — for testing vibration.
-     */
-    @Synchronized
-    fun startVibrationOnly() {
-        if (isRinging) {
-            AppLogger.i(TAG, "Alarm already ringing, ignoring vibration-only request")
-            return
-        }
-
-        AppLogger.i(TAG, "Starting vibration only (no sound)")
-        isRinging = true
-
-        startWakeLock()
-        startVibration()
-    }
-
-    /**
      * Stop the alarm: stop sound and vibration, release resources.
+     *
+     * v2.7.0: Always clean up, even when isRinging is already false. Previously a
+     * MediaPlayer error set isRinging=false while vibration + wakelock kept running; stopAlarm()
+     * was then a no-op and the vibration never stopped.
      */
     @Synchronized
     fun stopAlarm() {
-        if (!isRinging) {
-            return
-        }
-
-        AppLogger.i(TAG, "Stopping alarm")
+        if (isRinging) AppLogger.i(TAG, "Stopping alarm")
         isRinging = false
 
         stopWakeLock()
@@ -175,12 +158,16 @@ class TimerAlarmHelper(private val context: Context) {
 
     // ── Sound ───────────────────────────────────────────────────────
 
-    private fun startSound() {
+    private fun startSound(useFallback: Boolean = false) {
         try {
-            // Get default alarm ringtone URI
-            val alarmUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
-                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
-                ?: android.provider.Settings.System.DEFAULT_ALARM_ALERT_URI
+            // Default alarm ringtone; on a playback error fall back once to the ringtone
+            val alarmUri = if (!useFallback) {
+                RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+                    ?: android.provider.Settings.System.DEFAULT_ALARM_ALERT_URI
+            } else {
+                RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+                    ?: android.provider.Settings.System.DEFAULT_RINGTONE_URI
+            }
 
             mediaPlayer = MediaPlayer().apply {
                 setAudioAttributes(
@@ -192,16 +179,21 @@ class TimerAlarmHelper(private val context: Context) {
                 setDataSource(context, alarmUri)
                 isLooping = true  // Loop like a real alarm clock
                 setOnPreparedListener { mp ->
-                    mp.start()
-                    AppLogger.i(TAG, "Alarm sound started (looping)")
+                    synchronized(this@TimerAlarmHelper) {
+                        // Alarm may have been stopped while prepareAsync was still running
+                        if (!isRinging || mediaPlayer !== mp) return@setOnPreparedListener
+                        mp.start()
+                    }
+                    AppLogger.i(TAG, "Alarm sound started (looping, fallback=$useFallback)")
                 }
                 setOnErrorListener { mp, what, extra ->
-                    AppLogger.e(TAG, "MediaPlayer error: what=$what, extra=$extra")
-                    try {
-                        mp.release()
-                    } catch (_: Exception) {}
-                    mediaPlayer = null
-                    isRinging = false
+                    AppLogger.e(TAG, "MediaPlayer error: what=$what, extra=$extra (fallback=$useFallback)")
+                    synchronized(this@TimerAlarmHelper) {
+                        try { mp.release() } catch (_: Exception) {}
+                        if (mediaPlayer === mp) mediaPlayer = null
+                        // v2.7.0: do NOT reset isRinging (vibration keeps running); try fallback sound
+                        if (isRinging && !useFallback) startSound(useFallback = true)
+                    }
                     true // Error handled — prevents crash
                 }
                 prepareAsync()

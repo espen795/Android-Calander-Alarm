@@ -14,6 +14,7 @@ import io.github.calendaralarm.CalendarAlarmApp
 import io.github.calendaralarm.R
 import io.github.calendaralarm.data.AlarmRepository
 import io.github.calendaralarm.data.AlarmStore
+import io.github.calendaralarm.data.AlarmTransactions
 import io.github.calendaralarm.data.AppLogger
 import io.github.calendaralarm.service.AlarmNotificationHelper
 
@@ -21,7 +22,7 @@ import io.github.calendaralarm.service.AlarmNotificationHelper
  * F4: Pre-alarm notification receiver.
  *
  * Fires 60 minutes before an alarm is scheduled to ring, showing a notification with:
- * - "Dismiss" button: cancels the alarm immediately
+ * - "Turn off" button: cancels the alarm immediately
  * - "Skip this time" button: skips this occurrence (only for repeat alarms with repeatDays)
  *
  * The notification is posted on the alarms channel with high priority.
@@ -34,8 +35,8 @@ class PreAlarmReceiver : BroadcastReceiver() {
         const val ACTION_SKIP = "io.github.calendaralarm.action.PRE_ALARM_SKIP"
         const val EXTRA_ALARM_ID = AlarmRepository.EXTRA_ALARM_ID
 
-        // Notification ID offset for pre-alarm notifications (avoid collision with ringing notifications)
-        private const val NOTIFICATION_ID_OFFSET = 700000
+        // P1 review#17: Notification IDs come from the central register NotificationIds
+        // (6000 block, per alarmId). Was 700000 + alarmId — now its own disjoint block.
     }
 
     override fun onReceive(context: Context, intent: Intent) {
@@ -87,7 +88,7 @@ class PreAlarmReceiver : BroadcastReceiver() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        // "Dismiss" action → cancel the alarm
+        // "Turn off" action → cancel the alarm
         val turnOffIntent = Intent(context, PreAlarmReceiver::class.java).apply {
             action = ACTION_TURN_OFF
             putExtra(EXTRA_ALARM_ID, alarmId)
@@ -105,7 +106,7 @@ class PreAlarmReceiver : BroadcastReceiver() {
             .setAutoCancel(true)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_REMINDER)
-            .addAction(0, "Dismiss", turnOffPi)
+            .addAction(0, "Turn off", turnOffPi)
 
         // F5: "Skip this time" — only for repeat alarms
         if (alarm.repeatDays.isNotEmpty()) {
@@ -123,24 +124,27 @@ class PreAlarmReceiver : BroadcastReceiver() {
         val notification = builder.build()
 
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        notificationManager.notify(NOTIFICATION_ID_OFFSET + alarmId, notification)
+        notificationManager.notify(io.github.calendaralarm.service.NotificationIds.TAG_PRE_ALARM, io.github.calendaralarm.service.NotificationIds.preAlarm(alarmId), notification)
 
         AppLogger.i(TAG, "Pre-alarm notification shown for alarm id=$alarmId (${alarm.timeLabel})")
     }
 
     /**
-     * "Dismiss" button: cancel the alarm immediately.
+     * "Turn off" button: cancel the alarm immediately.
+     * P2B review#9: mutation inside the global alarm mutex (atomic with other paths).
      */
     private fun handleTurnOff(context: Context, alarmId: Int) {
-        val repo = AlarmRepository(context)
-        val alarm = repo.store.get(alarmId)
+        AlarmTransactions.run {
+            val repo = AlarmRepository(context)
+            val alarm = repo.store.get(alarmId)
 
-        if (alarm != null) {
-            AppLogger.i(TAG, "Pre-alarm 'Dismiss': cancelling alarm id=$alarmId (${alarm.timeLabel})")
-            // v2.6.13 L8: user tapped Dismiss themselves → force=true (no "removed" push)
-            repo.cancel(alarmId, force = true)
-        } else {
-            repo.cancel(alarmId, force = true) // best effort
+            if (alarm != null) {
+                AppLogger.i(TAG, "Pre-alarm 'Turn off': cancelling alarm id=$alarmId (${alarm.timeLabel})")
+                // v2.6.13 L8: user tapped Turn off themselves → force=true (no "removed" push)
+                repo.cancel(alarmId, force = true)  // reentrant
+            } else {
+                repo.cancel(alarmId, force = true) // best effort
+            }
         }
 
         // Cancel the pre-alarm notification
@@ -149,7 +153,7 @@ class PreAlarmReceiver : BroadcastReceiver() {
 
     /**
      * FC-02 fix: "Skip this time" button.
-     *
+     * 
      * CRITICAL FIX: Previously this called setEnabled(false) which set enabled=false
      * in the store. But scheduleOneShot() searches for skip alarms with filter
      * `it.enabled` — so a disabled alarm was NEVER found and skipCount was never
@@ -163,6 +167,13 @@ class PreAlarmReceiver : BroadcastReceiver() {
      * so the alarm is re-armed for the next matching day right away.
      */
     private fun handleSkip(context: Context, alarmId: Int) {
+        // P2B review#9: skip chain (incrementSkipCount → cancelAlarmManagerOnly →
+        // reschedule + notification cancel) atomic inside the global alarm mutex.
+        // No network I/O inside the lock — only store/AlarmManager/notification.
+        AlarmTransactions.run { handleSkipLocked(context, alarmId) }
+    }
+
+    private fun handleSkipLocked(context: Context, alarmId: Int) {
         val repo = AlarmRepository(context)
         val alarm = repo.store.get(alarmId)
 
@@ -194,12 +205,12 @@ class PreAlarmReceiver : BroadcastReceiver() {
             if (nextTrigger != null) {
                 val zone = java.time.ZoneId.systemDefault()
                 val nextDate = java.time.LocalDate.ofInstant(nextTrigger, zone).toString()
-                // v2.6.13 C1 FIX: the skip is consumed HERE — the record moves
+                // v2.6.13 C1 FIX: the skip is consumed HERE — the record shifts
                 // directly to the next occurrence and skipCount goes back to 0.
                 // Before this fix skipCount=1 stayed in the record; handleAlarmFired
-                // had the guard `skipCount == 0` and therefore NEVER re-armed anymore, which
-                // silently broke the repeat chain after one skip. Now the trigger is already shifted
-                // and skipCount is 0 again, so the next occurrence re-arms normally.
+                // had the guard `skipCount == 0` and therefore NEVER re-armed, which
+                // silently broke the repeat chain after one skip. Now the trigger is already
+                // shifted and skipCount is 0 again, so the next occurrence re-arms normally.
                 val rescheduled = alarm.copy(
                     triggerAtMillis = nextTrigger.toEpochMilli(),
                     date = nextDate,
@@ -217,7 +228,9 @@ class PreAlarmReceiver : BroadcastReceiver() {
 
     private fun cancelNotification(context: Context, alarmId: Int) {
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        notificationManager.cancel(NOTIFICATION_ID_OFFSET + alarmId)
+        notificationManager.cancel(io.github.calendaralarm.service.NotificationIds.TAG_PRE_ALARM, io.github.calendaralarm.service.NotificationIds.preAlarm(alarmId))
+        // N-f backwards-compat: also cancel legacy fixed IDs (700000+id, 6000+id)
+        io.github.calendaralarm.service.NotificationIds.legacyPreAlarmIds(alarmId).forEach { notificationManager.cancel(it) }
     }
 
     private fun hasNotificationPermission(context: Context): Boolean {

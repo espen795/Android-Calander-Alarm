@@ -24,7 +24,7 @@ import io.github.calendaralarm.CalendarAlarmApp
 import io.github.calendaralarm.data.AppLogger
 
 /**
- * Periodically uploads the in-app log buffer to the backend server so the maintainer
+ * Periodically uploads the in-app log buffer to the the server server so the server
  * can debug remotely. Only sends sanitized entries (AppLogger never contains
  * tokens or personal data). Sends only NEW entries since last successful upload.
  */
@@ -54,21 +54,33 @@ class LogUploadWorker(
 
     private val json = Json { ignoreUnknownKeys = true }
 
-    private val httpClient = HttpClient(CIO) {
-        install(ContentNegotiation) {
-            json(json)
-        }
-        followRedirects = false
-        engine {
-            requestTimeout = 15_000
-            // Certificate pinning (same as SyncRepository — Ktor CIO doesn't use Android NSC)
-            https {
-                trustManager = io.github.calendaralarm.sync.CertificatePinner.trustManager
+    /**
+     * Opus review B1: client per run (fixed host from the server URL) — no shared
+     * global expectedHost. Built in doWork() and closed in finally.
+     */
+    private fun buildClient(serverUrl: String): HttpClient {
+        val host = io.github.calendaralarm.sync.CertificatePins.extractHost(serverUrl)
+            ?: throw IllegalArgumentException("Invalid server URL (no host): $serverUrl — log upload refused (fail-closed)")
+        return HttpClient(CIO) {
+            install(ContentNegotiation) {
+                json(json)
+            }
+            followRedirects = false
+            engine {
+                requestTimeout = 15_000
+                https {
+                    // Pinning + hostname verification with the FIXED host (B1)
+                    trustManager = io.github.calendaralarm.sync.CertificatePinner.pinnedTrustManager(host)
+                }
             }
         }
     }
 
     private val userAgent = "CalendarAlarm/${io.github.calendaralarm.BuildConfig.VERSION_NAME} (Android ${android.os.Build.VERSION.RELEASE}; ${android.os.Build.MODEL})"
+
+    /** Client of the current run (closed in finally). */
+    @Volatile
+    private var clientInFlight: HttpClient? = null
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val settingsRepo = CalendarAlarmApp.settingsRepository
@@ -102,6 +114,9 @@ class LogUploadWorker(
         return@withContext try {
             val token = settingsRepo.getDeviceToken()
             val serverUrl = settingsRepo.getServerUrl()
+            // B1: client per run with the fixed host from the server URL (fail-closed on no host)
+            val httpClient = buildClient(serverUrl)
+            clientInFlight = httpClient
             val url = "${serverUrl.trimEnd('/')}/api/log"
             val response = httpClient.post(url) {
                 // K-03 fix: Token in Authorization header, NOT in URL query parameter
@@ -132,7 +147,9 @@ class LogUploadWorker(
             AppLogger.d(TAG, "Log upload error: ${e.javaClass.simpleName}")
             Result.retry()
         } finally {
-            httpClient.close()
+            // B1: client is built per run in doWork — close it here
+            runCatching { clientInFlight?.close() }
+            clientInFlight = null
         }
     }
 }

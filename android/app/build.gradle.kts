@@ -19,8 +19,8 @@ android {
         applicationId = prop("CALALARM_APPLICATION_ID", "io.github.calendaralarm")
         minSdk = 26
         targetSdk = 35
-        versionCode = 64
-        versionName = "2.6.13"
+        versionCode = 66
+        versionName = "2.8.0"
 
         // Self-hosted update feed (version.json + APKs). Empty = in-app updater disabled.
         buildConfigField("String", "UPDATE_SERVER_URL", "\"${prop("CALALARM_UPDATE_SERVER_URL", "")}\"")
@@ -157,6 +157,8 @@ dependencies {
     testImplementation("app.cash.turbine:turbine:1.2.0")
     testImplementation("androidx.compose.ui:ui-test-junit4:1.7.6")
     testImplementation("androidx.test:runner:1.6.2")
+    // TestListenableWorkerBuilder for AlarmSyncWorker tests
+    testImplementation("androidx.work:work-testing:2.10.0")
     testImplementation("androidx.test:rules:1.6.1")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.6.1")

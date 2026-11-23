@@ -43,9 +43,9 @@ class AlarmRepository(private val context: Context) {
     val store = AlarmStore(appContext)
 
     /**
-     * v2.3.0: Update the widget cache + trigger widget refresh.
+     * v2.3.0: Update the widget cache + trigger a widget refresh.
      * Call this after EVERY change to alarms (schedule, cancel, setEnabled, etc.)
-     * WidgetCache is an object (singleton) — call directly, no instance needed.
+     * WidgetCache is an object (singleton) — call it directly, no instance needed.
      */
     private fun updateWidget() {
         try {
@@ -57,6 +57,11 @@ class AlarmRepository(private val context: Context) {
         }
     }
 
+    // P1 review#1: state-prefs in device-protected storage (readable before unlock)
+    private val statePrefs: SharedPreferences by lazy {
+        DeviceProtectedStorage.prefs(appContext, PREFS_NAME)
+    }
+
     companion object {
         private const val TAG = "AlarmRepository"
         const val EXTRA_ALARM_ID = "calendar_alarm_id"
@@ -65,6 +70,8 @@ class AlarmRepository(private val context: Context) {
         // v2.6.0: Keys for SharedPreferences (last state of alarms for change detection)
         private const val PREFS_NAME = "AlarmRepositoryState"
         private const val KEY_LAST_ALARM_STATE_PREFIX = "last_alarm_state_"
+        /** N-c: trigger shorter than this in the past → fire now (not "missed"). */
+        const val MISSED_GRACE_MS = 10 * 60 * 1000L
     }
 
     // ============== v2.5.8: Alarm Freeze (kept for future use) ==============
@@ -131,33 +138,33 @@ class AlarmRepository(private val context: Context) {
     // ============== Scheduling ==============
 
     /**
-     * v2.6.12: State-key for change-dedup. Intentionally WITHOUT triggerAtMillis: on a
-     * reschedule of a repeat alarm triggerAtMillis shifts (next day), but
-     * the alarm is substantively identical — that must NOT notify (boot-reschedule silent).
+     * v2.6.12: State key for change dedup. Deliberately WITHOUT triggerAtMillis: when a
+     * repeat alarm is rescheduled, triggerAtMillis shifts (next day), but
+     * the alarm is substantively unchanged — that must NOT post a notification (boot reschedule stays silent).
      * Public/shared so unit tests can verify the key.
      */
     fun alarmStateKey(alarm: AlarmStore.OwnedAlarm): String =
         "${alarm.timeLabel}|${alarm.repeatDays.sorted()}|${alarm.label}|${alarm.enabled}"
 
     /**
-     * v2.6.0/v2.6.12: Show a notification only when the alarm actually changed.
+     * v2.6.0/v2.6.12: Only show a notification if the alarm actually changed.
      * v2.6.12: goes through the central funnel (AlarmNotificationHelper.notifyAlarmEvent).
-     * @param force true = system/boot-reschedule → NEVER notify (silent).
+     * @param force true = system/boot reschedule → NEVER notify (silent).
      */
     private fun showNotificationIfChanged(alarm: AlarmStore.OwnedAlarm, force: Boolean = false) {
         if (force) {
             // v2.6.12: boot/system reschedule is silent — but DO save the state so that a
             // later real change relative to this state is detected.
-            val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val prefs = statePrefs
             prefs.edit().putString("${KEY_LAST_ALARM_STATE_PREFIX}${alarm.id}", alarmStateKey(alarm)).apply()
             AppLogger.d(TAG, "force=true (boot/system) — notification suppressed (id=${alarm.id})")
             return
         }
-        val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val prefs = statePrefs
         val lastStateKey = "${KEY_LAST_ALARM_STATE_PREFIX}${alarm.id}"
         val lastState = prefs.getString(lastStateKey, null)
 
-        // v2.6.12: state-key without triggerAtMillis (see alarmStateKey)
+        // v2.6.12: state key without triggerAtMillis (see alarmStateKey)
         val currentState = alarmStateKey(alarm)
 
         if (lastState != currentState) {
@@ -189,7 +196,11 @@ class AlarmRepository(private val context: Context) {
      * All user-initiated scheduling (UI) must work 24/7.
      * The [force] parameter is kept for future use but no longer triggers freeze checks.
      */
-    fun schedule(alarm: AlarmStore.OwnedAlarm, force: Boolean = false): AlarmStore.OwnedAlarm? {
+    fun schedule(alarm: AlarmStore.OwnedAlarm, force: Boolean = false): AlarmStore.OwnedAlarm? =
+        AlarmTransactions.run { scheduleInternal(alarm, force) }
+
+    /** P2B review#9: echte body — draait binnen [AlarmTransactions] (reentrant). */
+    private fun scheduleInternal(alarm: AlarmStore.OwnedAlarm, force: Boolean = false): AlarmStore.OwnedAlarm? {
         AppLogger.d(TAG, "schedule() called: ${alarm.timeLabel} on ${alarm.date} (${alarm.label})")
         // v2.5.8: No freeze check here — user actions must always work
         // Automated sync is blocked at the AlarmSyncWorker level
@@ -238,7 +249,7 @@ class AlarmRepository(private val context: Context) {
             // v2.3.0: Widget cache update + refresh
             updateWidget()
 
-            // v2.6.12: Show notification only on change AND only when !force (boot/system silent)
+            // v2.6.12: Only show a notification on change AND only if !force (boot/system silent)
             showNotificationIfChanged(alarm, force = force)
 
             return alarm
@@ -254,7 +265,7 @@ class AlarmRepository(private val context: Context) {
      */
     private fun schedulePreAlarm(alarm: AlarmStore.OwnedAlarm) {
         val preAlarmTime = alarm.triggerAtMillis - PRE_ALARM_OFFSET_MS
-        if (preAlarmTime <= System.currentTimeMillis()) {
+        if (preAlarmTime <= io.github.calendaralarm.data.AppClock.now()) {
             AppLogger.d(TAG, "Pre-alarm time already past for alarm id=${alarm.id}, skipping")
             return
         }
@@ -319,6 +330,18 @@ class AlarmRepository(private val context: Context) {
         type: String = "manual",
         targetDate: LocalDate? = null,
         snoozeMinutesOverride: Int? = null  // v2.5.0: per-alarm snooze override (null = use global)
+    ): AlarmStore.OwnedAlarm? = AlarmTransactions.run {
+        scheduleOneShotInternal(timeLabel, label, days, type, targetDate, snoozeMinutesOverride)
+    }
+
+    /** P2B review#9: echte body — draait binnen [AlarmTransactions] (reentrant). */
+    private fun scheduleOneShotInternal(
+        timeLabel: String,
+        label: String,
+        days: List<Int> = emptyList(),
+        type: String = "manual",
+        targetDate: LocalDate? = null,
+        snoozeMinutesOverride: Int? = null
     ): AlarmStore.OwnedAlarm? {
         // F5 + FH-01 fix: Check for existing repeat alarm with skipCount > 0
         if (days.isNotEmpty()) {
@@ -332,7 +355,7 @@ class AlarmRepository(private val context: Context) {
                 // Consume one skip
                 val decremented = store.decrementSkipCount(existing.id)
                 val newSkipCount = decremented?.skipCount ?: (existing.skipCount - 1)
-                AppLogger.i(TAG, "F5 Skip this time: consuming skip for alarm id=${existing.id} (${existing.timeLabel}), remaining=$newSkipCount")
+                AppLogger.i(TAG, "F5 Skip deze keer: consuming skip for alarm id=${existing.id} (${existing.timeLabel}), remaining=$newSkipCount")
                 // Find next matching day AFTER today
                 val trigger = computeNextTriggerAfterToday(timeLabel, days) ?: return null
                 val zone = ZoneId.systemDefault()
@@ -378,15 +401,26 @@ class AlarmRepository(private val context: Context) {
      *
      * v2.6.13 (L1, recon RECON-notifications-2026-11-12): idempotent + silent.
      * - [silent] (default true): the sync path lets the repository notify NOTHING; the caller
-     *   (AlarmSyncWorker) is the ONLY notifier and computes SET/CHANGED/null BEFORE apply.
-     * - Identical plan → existing alarm re-armed with force=true (silent), rest force-cancel,
-     *   return same. No new ID, so the state-key-dedup in showNotificationIfChanged
-     *   works and "set to 10, still at 10" yields 0 notifications.
+     *   (AlarmSyncWorker) is the ONLY notifier and computes SET/CHANGED/null itself before apply.
+     * - Identical plan → existing alarm re-armed with force=true (silent), rest force-cancelled,
+     *   return same. No new ID, so the state-key dedup in showNotificationIfChanged
+     *   works and "set to 10, still 10" produces 0 notifications.
      * - Changed plan → reuse existing ID (setAlarmClock with same requestCode +
      *   FLAG_UPDATE_CURRENT replaces atomically; store.save only after success → HN-02 still holds),
-     *   schedule(newAlarm, force=silent), old cancels with force=true ("replace" ≠ "removed").
+     *   schedule(newAlarm, force=silent), old cancels with force=true ("replaced" ≠ "removed").
      */
     fun replaceForDate(
+        date: LocalDate,
+        timeLabel: String,
+        label: String,
+        type: String,
+        silent: Boolean = true
+    ): AlarmStore.OwnedAlarm? = AlarmTransactions.run {
+        replaceForDateInternal(date, timeLabel, label, type, silent)
+    }
+
+    /** P2B review#9: echte body — draait binnen [AlarmTransactions] (reentrant). */
+    private fun replaceForDateInternal(
         date: LocalDate,
         timeLabel: String,
         label: String,
@@ -399,7 +433,7 @@ class AlarmRepository(private val context: Context) {
         val trigger = ZonedDateTime.of(date, localTime, zone).toInstant()
 
         // HN-02: Reject past trigger times
-        if (trigger.toEpochMilli() <= System.currentTimeMillis()) {
+        if (trigger.toEpochMilli() <= io.github.calendaralarm.data.AppClock.now()) {
             AppLogger.w(TAG, "Rejecting alarm with past trigger time: $timeLabel on $dateStr")
             return null
         }
@@ -410,9 +444,9 @@ class AlarmRepository(private val context: Context) {
         }
 
         // v2.6.13 L1: idempotent — identical plan → notify nothing, only make sure
-        // AlarmManager is armed (silent), and silently clean up any duplicates.
+        // AlarmManager is armed (silently), and silently clean up any duplicates.
         // v2.6.13 H3: match regardless of `enabled` — a user-disabled alarm must also be
-        // found, so the sync does NOT re-enable it (see guard below).
+        // found, so that the sync does NOT re-enable it (see guard below).
         val same = existing.firstOrNull {
             it.timeLabel == timeLabel && it.label == label &&
                 it.triggerAtMillis == trigger.toEpochMilli()
@@ -420,13 +454,27 @@ class AlarmRepository(private val context: Context) {
         if (same != null) {
             if (!same.enabled && same.userDisabled) {
                 // v2.6.13 H3: the USER manually disabled this smart alarm (UI toggle,
-                // userDisabled=true). The sync may NOT override the user's choice:
-                // the alarm stays off and no notification follows. Only make sure the
-                // AlarmManager entry is not (anymore) armed.
+                // userDisabled=true). The sync must NOT override the user's choice:
+                // the alarm stays off and no notification is posted. Do make sure the
+                // AlarmManager entry is not (or no longer) armed.
                 cancelAlarmManagerOnly(same.id, same.preAlarmId)
                 existing.filter { it.id != same.id }.forEach { cancel(it.id, force = true) }
                 AppLogger.i(TAG, "v2.6.13 H3: user-disabled alarm for $dateStr — sync does NOT re-enable (id=${same.id})")
                 return same
+            }
+            if (!same.enabled) {
+                // P2B review#7: auto-disabled (enabled=false, userDisabled=false — e.g. just
+                // fired via handleAlarmFired, ringing state) with an IDENTICAL plan for a
+                // FUTURE date. The sync re-arms it in AlarmManager — then the record
+                // must also be saved with enabled=true, otherwise AlarmManager is armed but
+                // the store says disabled (inconsistent; UI shows "off" while the alarm does fire).
+                // For TODAY this path is never reached: AlarmSyncWorker B1-guard skips
+                // today when there is no pending alarm (a fired record is not pending).
+                val reEnabled = same.copy(enabled = true)
+                schedule(reEnabled, force = true)
+                existing.filter { it.id != same.id }.forEach { cancel(it.id, force = true) }
+                AppLogger.i(TAG, "P2B review#7: auto-disabled alarm for $dateStr — sync re-enables consistently (AlarmManager + store, id=${same.id})")
+                return reEnabled
             }
             schedule(same, force = true)
             existing.filter { it.id != same.id }.forEach { cancel(it.id, force = true) }
@@ -435,19 +483,19 @@ class AlarmRepository(private val context: Context) {
         }
 
         // v2.6.13 H3: if the USER disabled an existing smart alarm for this date
-        // (userDisabled=true, e.g. "no alarm tomorrow"), the sync may NOT
+        // (userDisabled=true, e.g. "no alarm tomorrow"), then the sync must NOT
         // override that choice with a new enabled alarm. We return the existing (disabled)
-        // alarm — the worker then sees enabled=false and may report CHANGED,
+        // alarm — the worker then sees enabled=false and may notify CHANGED,
         // but the alarm itself stays OFF as the user chose.
         val userDisabledAlarm = existing.firstOrNull { it.userDisabled }
         if (userDisabledAlarm != null) {
-            AppLogger.i(TAG, "v2.6.13 H3: user-disabled alarm for $dateStr (id=${userDisabledAlarm.id}) — sync does NOT override user choice")
+            AppLogger.i(TAG, "v2.6.13 H3: user-disabled alarm for $dateStr (id=${userDisabledAlarm.id}) — sync does NOT override the user's choice")
             cancelAlarmManagerOnly(userDisabledAlarm.id, userDisabledAlarm.preAlarmId)
             existing.filter { it.id != userDisabledAlarm.id }.forEach { cancel(it.id, force = true) }
             return userDisabledAlarm
         }
 
-        // v2.6.13 L1: Reuse ID → state-key-dedup works, no ID growth per sync
+        // v2.6.13 L1: reuse ID → state-key dedup works, no ID growth per sync
         val newAlarm = AlarmStore.OwnedAlarm(
             id = existing.firstOrNull()?.id ?: store.nextId(),
             triggerAtMillis = trigger.toEpochMilli(),
@@ -471,7 +519,7 @@ class AlarmRepository(private val context: Context) {
 
         // Step 2: Only after success, cancel old smart alarms for this date
         // (but NOT manual alarms, and NOT snoozes of the new alarm).
-        // v2.6.13 L1: always force=true — "replace" is not "removed", so silent.
+        // v2.6.13 L1: always force=true — "replaced" is not "removed", so silent.
         store.getAll()
             .filter { it.date == dateStr && it.id != newAlarm.id && it.type != "manual" && it.type != "test" }
             .forEach { cancel(it.id, force = true) }
@@ -488,24 +536,28 @@ class AlarmRepository(private val context: Context) {
      * v2.5.8: Alarm Freeze NO LONGER blocks this — user toggle must work 24/7.
      *
      * v2.6.13 H3: [userAction] (default true — the only caller is the UI toggle in
-     * MainScreen) marks the alarm as user-disabled when switching off, so the
-     * sync (replaceForDate) does not override the user's choice. When switching on,
+     * MainScreen) marks the alarm as user-disabled when turning it off, so that the
+     * sync (replaceForDate) does not override the user's choice. When turning it on,
      * the flag is cleared.
      */
-    fun setEnabled(id: Int, enabled: Boolean, force: Boolean = false, userAction: Boolean = true): Boolean {
+    fun setEnabled(id: Int, enabled: Boolean, force: Boolean = false, userAction: Boolean = true): Boolean =
+        AlarmTransactions.run { setEnabledInternal(id, enabled, force, userAction) }
+
+    /** P2B review#9: echte body — draait binnen [AlarmTransactions] (reentrant). */
+    private fun setEnabledInternal(id: Int, enabled: Boolean, force: Boolean = false, userAction: Boolean = true): Boolean {
         // v2.5.8: No freeze check — user actions must always work
         val alarm = store.get(id) ?: return false
         if (enabled) {
             // Re-schedule — clear userDisabled (user turns the alarm back on themselves)
             val updated = alarm.copy(enabled = true, userDisabled = false)
-            // v2.6.12: pass force so boot-reschedule via setEnabled is also silent
+            // v2.6.12: pass force through so boot reschedule via setEnabled is also silent
             val result = schedule(updated, force = force)
             return result != null
         } else {
             // Cancel AlarmManager entry but keep in store
             cancelAlarmManagerOnly(id, alarm.preAlarmId)
             if (userAction) {
-                // v2.6.13 H3: mark as user-disabled → sync may NOT re-enable this
+                // v2.6.13 H3: mark as user-disabled → sync must NOT re-enable this
                 store.setUserDisabled(id, true)
             } else {
                 store.setEnabled(id, false)
@@ -514,7 +566,7 @@ class AlarmRepository(private val context: Context) {
             // v2.3.0: Widget cache update
             updateWidget()
 
-            // v2.6.12: Show notification only on change (enabled is part of the state-key)
+            // v2.6.12: Only show a notification on change (enabled is part of the state key)
             showNotificationIfChanged(alarm.copy(enabled = false), force = force)
 
             return true
@@ -549,7 +601,11 @@ class AlarmRepository(private val context: Context) {
      *
      * v2.5.8: Alarm Freeze NO LONGER blocks this — user delete must work 24/7.
      */
-    fun cancel(id: Int, force: Boolean = false): Boolean {
+    fun cancel(id: Int, force: Boolean = false): Boolean =
+        AlarmTransactions.run { cancelInternal(id, force) }
+
+    /** P2B review#9: echte body — draait binnen [AlarmTransactions] (reentrant). */
+    private fun cancelInternal(id: Int, force: Boolean = false): Boolean {
         // v2.5.8: No freeze check — user actions must always work
         val alarm = store.get(id) ?: return false
         val opIntent = Intent(context, OwnedAlarmReceiver::class.java).apply {
@@ -570,8 +626,8 @@ class AlarmRepository(private val context: Context) {
 
             // v2.6.12: "Alarm removed" (E3) — ONLY if the alarm really existed (here: yes,
             // because store.get(id) != null) and ONLY if !force (boot/system cancel = silent).
-            // Clear the saved state so a new alarm with the same ID gets a notification.
-            val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            // Clear the saved state so that a new alarm with the same ID does get a notification.
+            val prefs = statePrefs
             prefs.edit().remove("${KEY_LAST_ALARM_STATE_PREFIX}$id").apply()
             if (!force) {
                 io.github.calendaralarm.service.AlarmNotificationHelper.notifyAlarmEvent(
@@ -597,11 +653,15 @@ class AlarmRepository(private val context: Context) {
      * Used when server says "no alarm" (e.g. weekend without weekend rule).
      * Returns the number of cancelled alarms.
      *
-     * v2.6.13 (L4): [force] is passed to cancel() — the sync path (worker) uses
-     * force=true and itself reports 1× aggregate-REMOVED (only when something was really removed),
-     * so no duplicate per-alarm REMOVED notifications arise.
+     * v2.6.13 (L4): [force] is passed through to cancel() — the sync path (worker) uses
+     * force=true and itself posts 1× aggregate REMOVED (only if something was really removed),
+     * so that no duplicate per-alarm REMOVED notifications occur.
      */
-    fun cancelForDate(date: LocalDate, force: Boolean = false): Int {
+    fun cancelForDate(date: LocalDate, force: Boolean = false): Int =
+        AlarmTransactions.run { cancelForDateInternal(date, force) }
+
+    /** P2B review#9: echte body — draait binnen [AlarmTransactions] (reentrant). */
+    private fun cancelForDateInternal(date: LocalDate, force: Boolean = false): Int {
         val dateStr = date.toString()
         val toCancel = store.getAll()
             .filter { it.date == dateStr && it.type != "manual" && it.type != "test" }
@@ -610,12 +670,15 @@ class AlarmRepository(private val context: Context) {
             if (cancel(alarm.id, force = force)) count++
         }
         if (count > 0) {
-            AppLogger.i(TAG, "Cancelled $count alarm(s) for $dateStr (no alarm day, force=$force)")
+            AppLogger.i(TAG, "Cancelled $count alarm(s) for $dateStr (no-alarm day, force=$force)")
         }
         return count
     }
 
-    fun cancelAll(): Int {
+    fun cancelAll(): Int = AlarmTransactions.run { cancelAllInternal() }
+
+    /** P2B review#9: echte body — draait binnen [AlarmTransactions] (reentrant). */
+    private fun cancelAllInternal(): Int {
         val all = store.removeAll()
         all.forEach { alarm ->
             val opIntent = Intent(context, OwnedAlarmReceiver::class.java).apply {
@@ -642,20 +705,40 @@ class AlarmRepository(private val context: Context) {
      * v2.5.7 Story 3: System operation — bypasses Alarm Freeze (force=true).
      * This runs on boot and must restore alarms even during freeze hours.
      */
-    fun rescheduleAll() {
-        val now = System.currentTimeMillis()
+    fun rescheduleAll() = AlarmTransactions.run { rescheduleAllInternal() }
+
+    /** P2B review#9: echte body — draait binnen [AlarmTransactions] (reentrant). */
+    private fun rescheduleAllInternal() {
+        val now = io.github.calendaralarm.data.AppClock.now()
         store.getAll().forEach { alarm ->
             if (!alarm.enabled) return@forEach
+            // N-c (review): a trigger that was < 10 min in the past (phone briefly off /
+            // TIME_SET / boot just missed) → fire NOW (now+5s) instead of moving to
+            // next week or reporting "missed". When in doubt: RING.
+            if (alarm.triggerAtMillis <= now && now - alarm.triggerAtMillis < MISSED_GRACE_MS) {
+                val fireAt = now + 5_000
+                AppLogger.i(TAG, "N-c: alarm id=${alarm.id} (${alarm.timeLabel}) was ${now - alarm.triggerAtMillis}ms in the past (<10min) — firing NOW (now+5s)")
+                val fireNow = alarm.copy(triggerAtMillis = fireAt, enabled = true)
+                val scheduled = schedule(fireNow, force = true)
+                if (scheduled == null) {
+                    AppLogger.e(TAG, "N-c: could not schedule alarm id=${alarm.id} for now+5s — keeping record")
+                    notifyRescheduleFailed(alarm)
+                }
+                return@forEach
+            }
             if (alarm.triggerAtMillis <= now) {
                 // FC-03: For repeat alarms, compute the next trigger instead of removing.
                 // v2.6.13 C1 FIX: the guard `skipCount == 0` has been REMOVED. A skip is
-                // consumed in PreAlarmReceiver.handleSkip itself (the record is moved directly
-                // to the next occurrence with skipCount reset), so a
-                // repeat alarm with skipCount > 0 in the store is abnormal — on boot
-                // we must still re-arm instead of deleting the record, otherwise
-                // the repeat chain silently breaks after a skip + reboot.
+                // consumed in PreAlarmReceiver.handleSkip itself (the record is immediately
+                // moved to the next occurrence with skipCount reset), so a
+                // repeat alarm with skipCount > 0 in the store is abnormal — at boot
+                // we must STILL re-arm instead of deleting the record, otherwise
+                // the repeat chain breaks silently after a skip + reboot.
+                // P1 review#4/#5: use computeNextTrigger (FROM TODAY, so today
+                // if the time has not passed yet) instead of computeNextTriggerAfterToday —
+                // otherwise a repeat alarm fires a day late after a boot.
                 if (alarm.repeatDays.isNotEmpty()) {
-                    val nextTrigger = computeNextTriggerAfterToday(alarm.timeLabel, alarm.repeatDays)
+                    val nextTrigger = computeNextTrigger(alarm.timeLabel, alarm.repeatDays, null)
                     if (nextTrigger != null) {
                         val zone = ZoneId.systemDefault()
                         val nextDate = LocalDate.ofInstant(nextTrigger, zone).toString()
@@ -663,24 +746,100 @@ class AlarmRepository(private val context: Context) {
                             triggerAtMillis = nextTrigger.toEpochMilli(),
                             date = nextDate,
                             enabled = true,
-                            skipCount = 0  // v2.6.13 C1: skip already consumed when shifting
+                            skipCount = 0  // v2.6.13 C1: skip was already consumed when shifting
                         )
-                        // Remove old, schedule new (same ID to avoid duplicate entries)
-                        store.remove(alarm.id)
-                        schedule(updated, force = true)  // v2.5.7: system operation
-                        AppLogger.i(TAG, "v2.6.13 C1 rescheduleAll: repeat alarm id=${alarm.id} rescheduled to $nextDate at ${alarm.timeLabel} (skipCount was ${alarm.skipCount})")
+                        // P1 review#4/#5: FIRST schedule (same ID), only on success replace the
+                        // record — NEVER remove before rescheduling (otherwise
+                        // the alarm disappears on a schedule error).
+                        val scheduled = schedule(updated, force = true)  // v2.5.7: system operation
+                        if (scheduled != null) {
+                            // schedule() already did store.save(updated) (same id) —
+                            // record atomically replaced, no remove needed.
+                            AppLogger.i(TAG, "P1 #4 rescheduleAll: repeat alarm id=${alarm.id} rescheduled to $nextDate at ${alarm.timeLabel} (was ${alarm.date}, skipCount was ${alarm.skipCount})")
+                        } else {
+                            // On failure: KEEP the record (do not delete!) + log + notification
+                            AppLogger.e(TAG, "P1 #4 rescheduleAll: could NOT reschedule repeat alarm id=${alarm.id} — keeping record")
+                            notifyRescheduleFailed(alarm)
+                        }
                         return@forEach
                     }
                 }
-                // Past one-shot or no next trigger — drop it
-                store.remove(alarm.id)
-                AppLogger.d(TAG, "rescheduleAll: removed past alarm id=${alarm.id}")
+                // P1 review#5: missed one-shot alarm (past, still enabled) → do NOT silently
+                // remove, but post "Alarm at HH:mm missed" and disable the record.
+                // Fail-safe: the record stays (enabled=false) so it is visible
+                // in the UI and the user can reactivate it manually.
+                AppLogger.w(TAG, "P1 #5 rescheduleAll: one-shot alarm id=${alarm.id} missed (${alarm.timeLabel} ${alarm.date}) — notification + disable")
+                store.setEnabled(alarm.id, false)
+                notifyMissedAlarm(alarm)
                 return@forEach
             }
             schedule(alarm, force = true)  // v2.5.7: system operation
         }
         // v2.3.0: Update widget after rescheduling all
         updateWidget()
+    }
+
+    /**
+     * P1 review#5: notification that a one-shot alarm was missed (e.g. phone off
+     * while it was firing). Notification via the central registry (MISSED_ALARM).
+     */
+    private fun notifyMissedAlarm(alarm: AlarmStore.OwnedAlarm) {
+        try {
+            val nm = appContext.getSystemService(Context.NOTIFICATION_SERVICE) as? android.app.NotificationManager
+            if (nm != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                val granted = androidx.core.content.ContextCompat.checkSelfPermission(
+                    appContext, android.Manifest.permission.POST_NOTIFICATIONS
+                ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                if (!granted) return
+            }
+            val pi = android.app.PendingIntent.getActivity(
+                appContext, 0,
+                Intent(appContext, io.github.calendaralarm.MainActivity::class.java),
+                android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT
+            )
+            val n = androidx.core.app.NotificationCompat.Builder(appContext, io.github.calendaralarm.CalendarAlarmApp.CHANNEL_ALARMS)
+                .setContentTitle("⏰ Alarm missed: ${alarm.timeLabel}")
+                .setContentText("${alarm.label} (${alarm.date}) fired while the phone was off — it has been turned off")
+                .setSmallIcon(io.github.calendaralarm.R.drawable.ic_notification)
+                .setContentIntent(pi)
+                .setAutoCancel(true)
+                .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH)
+                .build()
+            nm?.notify(io.github.calendaralarm.service.NotificationIds.MISSED_ALARM, n)
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "P1: posting missed-alarm notification failed: ${e.message}")
+        }
+    }
+
+    /**
+     * P1 review#4/#5: notification + log when a repeat alarm could not be rescheduled.
+     */
+    private fun notifyRescheduleFailed(alarm: AlarmStore.OwnedAlarm) {
+        try {
+            val nm = appContext.getSystemService(Context.NOTIFICATION_SERVICE) as? android.app.NotificationManager
+            if (nm != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                val granted = androidx.core.content.ContextCompat.checkSelfPermission(
+                    appContext, android.Manifest.permission.POST_NOTIFICATIONS
+                ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                if (!granted) return
+            }
+            val pi = android.app.PendingIntent.getActivity(
+                appContext, 0,
+                Intent(appContext, io.github.calendaralarm.MainActivity::class.java),
+                android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT
+            )
+            val n = androidx.core.app.NotificationCompat.Builder(appContext, io.github.calendaralarm.CalendarAlarmApp.CHANNEL_ALARMS)
+                .setContentTitle("⚠️ Alarm reschedule failed: ${alarm.timeLabel}")
+                .setContentText("${alarm.label} — open the app to schedule it again")
+                .setSmallIcon(io.github.calendaralarm.R.drawable.ic_notification)
+                .setContentIntent(pi)
+                .setAutoCancel(true)
+                .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH)
+                .build()
+            nm?.notify(io.github.calendaralarm.service.NotificationIds.RESCHEDULE_FAILED, n)
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "P1: posting reschedule-failed notification failed: ${e.message}")
+        }
     }
 
     fun getNextAlarm(): AlarmStore.OwnedAlarm? = store.getNext()
@@ -704,7 +863,8 @@ class AlarmRepository(private val context: Context) {
     fun computeNextTrigger(
         timeLabel: String,
         days: List<Int>,
-        targetDate: LocalDate?
+        targetDate: LocalDate?,
+        nowMillis: Long = AppClock.now()
     ): java.time.Instant? {
         val zone = ZoneId.systemDefault()
         val localTime = try { LocalTime.parse(timeLabel) } catch (e: Exception) { return null }
@@ -713,7 +873,9 @@ class AlarmRepository(private val context: Context) {
             return ZonedDateTime.of(targetDate, localTime, zone).toInstant()
         }
 
-        val now = LocalDateTime.now(zone)
+        // One clock source (System.currentTimeMillis) for all time decisions: previously
+        // LocalDateTime.now() here and currentTimeMillis in rescheduleAll — two clocks. Now AppClock.
+        val now = LocalDateTime.ofInstant(java.time.Instant.ofEpochMilli(nowMillis), zone)
         if (days.isEmpty()) {
             // One-shot: today if in future, else tomorrow
             var candidate = ZonedDateTime.of(now.toLocalDate(), localTime, zone)
@@ -753,7 +915,7 @@ class AlarmRepository(private val context: Context) {
 
         if (days.isEmpty()) return null
 
-        val tomorrow = LocalDate.now(zone).plusDays(1)
+        val tomorrow = java.time.Instant.ofEpochMilli(AppClock.now()).atZone(zone).toLocalDate().plusDays(1)
 
         // Search up to 8 days ahead starting from tomorrow
         for (offset in 0..7) {
@@ -774,6 +936,6 @@ class AlarmRepository(private val context: Context) {
      */
     fun computePreAlarmTime(triggerAtMillis: Long): Long? {
         val preAlarmTime = triggerAtMillis - PRE_ALARM_OFFSET_MS
-        return if (preAlarmTime > System.currentTimeMillis()) preAlarmTime else null
+        return if (preAlarmTime > io.github.calendaralarm.data.AppClock.now()) preAlarmTime else null
     }
 }

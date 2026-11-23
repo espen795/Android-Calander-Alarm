@@ -2,8 +2,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- SCHEDULE_EXACT_ALARM: required for AlarmManager.setAlarmClock on Android 12+ -->
-    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <!-- SCHEDULE_EXACT_ALARM: Android 12–12L (API 31–32) — from API 33 (Android 13)
+         replaced by USE_EXACT_ALARM (see below). -->
+    <uses-permission
+        android:name="android.permission.SCHEDULE_EXACT_ALARM"
+        android:maxSdkVersion="32" />
+    <!-- P1 review#10 / N-e: USE_EXACT_ALARM — from API 33 (Android 13) the grantable
+         variant; on Android 14+ (API 34+) to be enabled by the user. -->
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
 
     <!-- Network for HTTPS pull sync + update downloads -->
     <uses-permission android:name="android.permission.INTERNET" />
@@ -59,11 +65,12 @@
             </intent-filter>
         </activity>
 
-        <!-- v2.6.10: Simplified for lockscreen compatibility (GPT Sol analysis) -->
-        <!-- Removed: singleInstance, taskAffinity, showForAllUsers — A/B test -->
-        <!-- v2.6.13 H2: configChanges prevents rotation/dark-mode/font-change from destroying the activity
-             (onDestroy previously stopped the alarm silently). Back gesture is intercepted
-             via OnBackPressedCallback (back = snooze or dismiss). -->
+    <!-- v2.6.10: Simplified for lockscreen compatibility (GPT Sol analysis) -->
+    <!-- Removed: singleInstance, taskAffinity, showForAllUsers — A/B test -->
+    <!-- v2.6.13 H2: configChanges prevents rotation/dark-mode/font-switch from destroying the activity
+         (onDestroy previously stopped the alarm silently). Back gesture is intercepted
+         via OnBackPressedCallback (back = snooze or dismiss). -->
+    <!-- P1 review#1: directBootAware — full-screen alarm before the first unlock -->
         <activity
             android:name=".ui.AlarmRingingActivity"
             android:exported="false"
@@ -72,37 +79,30 @@
             android:showOnLockScreen="true"
             android:showWhenLocked="true"
             android:turnScreenOn="true"
+            android:directBootAware="true"
             android:configChanges="orientation|screenSize|uiMode|keyboardHidden|screenLayout|smallestScreenSize|density|fontScale"
             android:theme="@style/Theme.CalendarAlarm" />
 
-        <!-- v2.6.10: Timer activity also simplified -->
+    <!-- v2.7.0: singleTop + configChanges — one instance; rotation/dark mode does not
+         destroy the activity. The sound is owned by TimerRingService (not by the activity). -->
         <activity
             android:name=".ui.TimerRingingActivity"
             android:exported="false"
-            android:launchMode="standard"
+            android:launchMode="singleTop"
+            android:configChanges="orientation|screenSize|uiMode|keyboardHidden|screenLayout|smallestScreenSize|density|fontScale"
             android:excludeFromRecents="true"
             android:showOnLockScreen="true"
             android:showWhenLocked="true"
             android:turnScreenOn="true"
             android:theme="@style/Theme.CalendarAlarm" />
 
-        <!-- v2.3.0: Widget debug activity (development/testing only) -->
-        <activity
-            android:name=".ui.WidgetDebugActivity"
-            android:exported="false"
-            android:label="Widget Debug"
-            android:theme="@style/Theme.CalendarAlarm">
-            <intent-filter>
-                <action android:name="io.github.calendaralarm.WIDGET_DEBUG" />
-                <category android:name="android.intent.category.DEFAULT" />
-            </intent-filter>
-        </activity>
-
         <!-- Alarm receiver (fires alarms, handles snooze/dismiss) -->
+        <!-- P1 review#1: directBootAware — also before the first unlock after boot -->
         <receiver
             android:name=".receiver.OwnedAlarmReceiver"
             android:enabled="true"
-            android:exported="false" />
+            android:exported="false"
+            android:directBootAware="true" />
 
         <!-- F4: Pre-alarm receiver (shows notification 60 min before alarm, handles turn-off/skip actions) -->
         <receiver
@@ -129,21 +129,65 @@
             android:exported="false"
             android:foregroundServiceType="mediaPlayback" />
 
-        <!-- v2.5.7: Alarm foreground service (Samsung OOM killer protection for alarm sound) -->
+        <!-- v2.7.0: Timer afgelopen — enige eigenaar van geluid + full-screen intent -->
         <service
-            android:name=".service.AlarmForegroundService"
+            android:name=".service.TimerRingService"
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="mediaPlayback" />
 
-        <!-- Boot & package-replaced receiver for alarm re-arming -->
+        <!-- v2.5.7: Alarm foreground service (Samsung OOM killer protection for alarm sound) -->
+        <!-- P1 review#1: directBootAware — an alarm can ring before the first unlock -->
+        <service
+            android:name=".service.AlarmForegroundService"
+            android:enabled="true"
+            android:exported="false"
+            android:directBootAware="true"
+            android:foregroundServiceType="mediaPlayback" />
+
+        <!-- P1 review#1: Boot & package-replaced receiver — directBootAware + LOCKED_BOOT_COMPLETED
+             so alarms are also rescheduled before the first unlock after a reboot -->
         <receiver
             android:name=".service.BootReceiver"
             android:enabled="true"
-            android:exported="true">
+            android:exported="true"
+            android:directBootAware="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- P1 review#10: exact-alarm permission changed → rescheduleAll -->
+        <receiver
+            android:name=".receiver.ExactAlarmPermissionReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.app.action.SCHEDULE_EXACT_ALARM_PERMISSION_STATE_CHANGED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- P1 review#11: timezone/time changed → recompute alarms from timeLabel+date -->
+        <receiver
+            android:name=".receiver.TimeChangeReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.TIMEZONE_CHANGED" />
+                <action android:name="android.intent.action.TIME_SET" />
+            </intent-filter>
+        </receiver>
+
+        <!-- N-a/N-b (review): after unlock — secure prefs re-init, DP migration check, workers -->
+        <receiver
+            android:name=".receiver.UserUnlockReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:directBootAware="true">
+            <intent-filter>
+                <action android:name="android.intent.action.USER_UNLOCKED" />
             </intent-filter>
         </receiver>
 

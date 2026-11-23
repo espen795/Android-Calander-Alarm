@@ -34,9 +34,11 @@ class DownloadVerifiedUpdateWorker(
     companion object {
         private const val TAG = "DownloadUpdateWorker"
         const val WORK_NAME = "calalarm_verified_update_download"
-        private const val NOTIFICATION_ID_INSTALL = 4100  // C-01 fix: was 4001 (collision with NOTIFICATION_ID_RINGING)
-        private const val NOTIFICATION_ID_DOWNLOADING = 4101   // v2.5.9: "Download started" ongoing notification
-        private const val NOTIFICATION_ID_DOWNLOAD_FAILED = 4102 // v2.5.9: "Download failed" notification
+        // P1 review#17: IDs moved to the 3000 block (updates) via NotificationIds —
+        // 4100 collided with NOTIFICATION_ID_ALARM_SERVICE (AlarmForegroundService FGS).
+        private const val NOTIFICATION_ID_INSTALL = io.github.calendaralarm.service.NotificationIds.UPDATE_INSTALL
+        private const val NOTIFICATION_ID_DOWNLOADING = io.github.calendaralarm.service.NotificationIds.UPDATE_DOWNLOADING
+        private const val NOTIFICATION_ID_DOWNLOAD_FAILED = io.github.calendaralarm.service.NotificationIds.UPDATE_DOWNLOAD_FAILED
         const val KEY_APK_PATH = "apk_path"       // v2.5.4 PM fix C-01: for UI install intent
         const val KEY_APK_VERSION = "apk_version"  // v2.5.4 PM fix C-01
     }

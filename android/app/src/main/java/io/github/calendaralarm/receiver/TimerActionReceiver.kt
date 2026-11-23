@@ -16,10 +16,10 @@ private const val TAG = "TimerActionReceiver"
 /**
  * v2.5.3 Story 4: Broadcast receiver for timer notification actions.
  *
- * Handles the "Stoppen" action from the ongoing timer notification.
- * Stops the timer alarm sound/vibration via TimerAlarmHelper shared instance.
+ * Handles the "Stop" action from the ongoing timer notification.
+ * Stops the timer alarm sound/vibration via the TimerAlarmHelper shared instance.
  *
- * v2.5.6: Also clears TimerStateStore + cancels AlarmManager + stops foreground service.
+ * v2.5.6: Also clears TimerStateStore + cancels AlarmManager + stops the foreground service.
  * This ensures a stopped timer does not fire again after an app restart.
  */
 class TimerActionReceiver : BroadcastReceiver() {
@@ -35,10 +35,10 @@ class TimerActionReceiver : BroadcastReceiver() {
             ACTION_STOP_TIMER -> {
                 AppLogger.i(TAG, "v2.6.8: Stop timer action received — stopping alarm")
                 
-                // v2.6.8: Stop TimerAlarmHelper (sound + vibration)
-                TimerAlarmHelper.stopSharedAlarm()
+                // v2.7.0: Stop the ringing via the single owner (TimerRingService)
+                io.github.calendaralarm.service.TimerRingService.stop(context)
                 
-                // v2.6.8: Wis TimerState + cancel AlarmManager + stop foreground service
+                // v2.6.8: Clear TimerState + cancel AlarmManager + stop foreground service
                 try {
                     val stateStore = TimerStateStore(context)
                     val scheduler = TimerScheduler(context)

@@ -66,9 +66,6 @@ Design points:
 - English/Dutch UI everywhere, more languages via `strings.xml`.
 - F-Droid / reproducible builds once there are no proprietary dependencies in the
   `foss` flavour.
-- Fix 10 pre-existing failing unit tests, currently marked `@Ignore` with a pointer
-  here: 4 in `RepeatAlarmChainFixTest` (repeat/snooze re-arm chain) and 6 in
-  `SettingsRepositoryTest` (Robolectric secure-storage assumptions).
 
 The detailed comparison and sequence diagrams are in
 [docs/CALENDAR-PROVIDERS.md](docs/CALENDAR-PROVIDERS.md).

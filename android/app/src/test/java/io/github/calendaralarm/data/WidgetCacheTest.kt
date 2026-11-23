@@ -6,11 +6,22 @@ import org.junit.Test
 import java.util.Calendar
 
 /**
- * Unit tests voor WidgetCache — formatNextAlarm() logica.
+ * Unit tests for WidgetCache — formatNextAlarm() logic.
  *
- * Test de Samsung-compatible alarm tekst formatting zonder Android dependencies.
+ * Tests the Samsung-compatible alarm text formatting without Android dependencies.
  */
 class WidgetCacheTest {
+
+    // Fixed clock (Mon 23-11-2026 10:00 Amsterdam): "in 2 hours" is then always today.
+    // On the real clock this test failed after 22:00.
+    @org.junit.Before
+    fun fixClock() {
+        FixedClock.set(java.time.ZonedDateTime.of(2026, 11, 23, 10, 0, 0, 0, java.time.ZoneId.of("Europe/Amsterdam")))
+    }
+
+    @org.junit.After
+    fun resetClock() = FixedClock.reset()
+
 
     @Test
     fun `formatNextAlarm returns default text when alarm is null`() {
@@ -27,16 +38,16 @@ class WidgetCacheTest {
 
     @Test
     fun `formatNextAlarm returns default text when alarm is in the past`() {
-        val pastTime = System.currentTimeMillis() - 60_000 // 1 minute ago
+        val pastTime = FixedClock.now() - 60_000 // 1 minute ago
         val alarm = createTestAlarm(triggerAtMillis = pastTime, enabled = true)
         val result = WidgetCache.formatNextAlarm(alarm)
         assertEquals("No alarm scheduled", result)
     }
 
     @Test
-    fun `formatNextAlarm shows vandaag for alarm today`() {
-        // Alarm over 2 uur vanaf nu (zeker vandaag)
-        val twoHoursFromNow = System.currentTimeMillis() + (2 * 60 * 60 * 1000)
+    fun `formatNextAlarm shows today for alarm today`() {
+        // Alarm in 2 hours from now (certainly today)
+        val twoHoursFromNow = FixedClock.now() + (2 * 60 * 60 * 1000)
         val alarm = createTestAlarm(
             triggerAtMillis = twoHoursFromNow,
             timeLabel = "14:30",
@@ -51,9 +62,9 @@ class WidgetCacheTest {
     }
 
     @Test
-    fun `formatNextAlarm shows morgen for alarm tomorrow`() {
-        // Alarm morgen zelfde tijd
-        val cal = Calendar.getInstance()
+    fun `formatNextAlarm shows tomorrow for alarm tomorrow`() {
+        // Alarm tomorrow at the same time
+        val cal = Calendar.getInstance().apply { timeInMillis = FixedClock.now() }
         cal.add(Calendar.DAY_OF_YEAR, 1)
         cal.set(Calendar.HOUR_OF_DAY, 8)
         cal.set(Calendar.MINUTE, 0)
@@ -73,7 +84,7 @@ class WidgetCacheTest {
     @Test
     fun `formatNextAlarm shows weekday for alarm later this week`() {
         // Alarm over 3 dagen
-        val cal = Calendar.getInstance()
+        val cal = Calendar.getInstance().apply { timeInMillis = FixedClock.now() }
         cal.add(Calendar.DAY_OF_YEAR, 3)
         cal.set(Calendar.HOUR_OF_DAY, 7)
         cal.set(Calendar.MINUTE, 30)
@@ -86,7 +97,7 @@ class WidgetCacheTest {
             enabled = true
         )
         val result = WidgetCache.formatNextAlarm(alarm)
-        // Should NOT contain "vandaag" or "morgen"
+        // Should NOT contain "today" or "tomorrow"
         assertTrue("Should NOT contain 'today': $result", !result.contains("today"))
         assertTrue("Should NOT contain 'tomorrow': $result", !result.contains("tomorrow"))
         // Should contain home emoji
@@ -95,7 +106,7 @@ class WidgetCacheTest {
 
     @Test
     fun `formatNextAlarm uses correct emoji for alarm type`() {
-        val futureTime = System.currentTimeMillis() + (2 * 60 * 60 * 1000)
+        val futureTime = FixedClock.now() + (2 * 60 * 60 * 1000)
 
         val officeAlarm = createTestAlarm(futureTime, "09:00", "Office", "office", true)
         assertTrue(WidgetCache.formatNextAlarm(officeAlarm).contains("🏢"))
@@ -115,21 +126,21 @@ class WidgetCacheTest {
 
     @Test
     fun `formatNextAlarm format is consistent`() {
-        val futureTime = System.currentTimeMillis() + (2 * 60 * 60 * 1000)
-        val alarm = createTestAlarm(futureTime, "06:45", "Kantoor", "office", true)
+        val futureTime = FixedClock.now() + (2 * 60 * 60 * 1000)
+        val alarm = createTestAlarm(futureTime, "06:45", "Office", "office", true)
 
         val result = WidgetCache.formatNextAlarm(alarm)
 
         // Format: "{emoji} {day} {time} — {label}"
-        // Example: "🏢 vandaag 06:45 — Kantoor"
+        // Example: "🏢 today 06:45 — Office"
         assertTrue("Should match expected format: $result",
-            result.matches(Regex("^🏢 (today|tomorrow|\\p{L}{2}) 06:45 — Kantoor$")))
+            result.matches(Regex("^🏢 (today|tomorrow|\\p{L}{2}) 06:45 — Office$")))
     }
 
     // ============== Helper ==============
 
     private fun createTestAlarm(
-        triggerAtMillis: Long = System.currentTimeMillis() + 3_600_000,
+        triggerAtMillis: Long = FixedClock.now() + 3_600_000,
         timeLabel: String = "07:00",
         label: String = "Test",
         type: String = "manual",

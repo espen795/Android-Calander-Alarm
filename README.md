@@ -7,32 +7,45 @@ that you control; the app simply pulls the result over HTTPS.
 
 - **Android app** (Kotlin + Jetpack Compose, `android/`) — minSdk 26 (Android 8.0), targetSdk 35
 - **Backend API** (Python/FastAPI, `server/`) — Dockerized, designed to sit behind a reverse proxy
-- Current version: **2.6.13** (`io.github.calendaralarm`)
+- Current version: **2.8.0** (`io.github.calendaralarm`)
 
 ## Features
 
 - **Calendar-driven wake time** — the app polls `GET /api/alarm/next` on your backend; the
   backend reads tomorrow's events from your Microsoft 365/Outlook calendar via Microsoft
   Graph and matches event subjects against configurable keyword rules (e.g. `office`,
-  `home`, `off`) to choose the wake time.
+  `home`, `off`) to choose the wake time. The server caches the last good plan per day and
+  serves it when the calendar is temporarily unreachable.
 - **Reliable exact alarms** — alarms are scheduled with `AlarmManager.setAlarmClock()`
-  and fire a full-screen ringing activity over the lock screen.
+  and fire a full-screen ringing activity over the lock screen; they keep working after a
+  reboot **before the first unlock** (direct boot) and are recomputed when the time zone or
+  clock changes.
 - **Pre-alarm notification** — a heads-up 60 minutes before the alarm, with "turn off" and
   "skip this time" actions.
 - **Manual alarms** — add your own alarms with labels, repetition days, snooze and skip.
-- **Countdown timer** — with live countdown notification and full-screen ringing on finish.
+- **Countdown timer** — with live countdown notification and a dedicated foreground
+  service for full-screen ringing on finish.
 - **Home-screen widget** — live clock, date and next alarm.
 - **Rule editing from the app** — read and edit the server-side keyword rules via
   `GET`/`POST /api/config`.
-- **Self-hosted updates** — optional update feed (`version.json` + SHA-256-verified,
-  signature-checked APK downloads).
+- **Heartbeat & monitoring** — the app reports its scheduled alarms and permission status
+  to the server every 3 h; `GET /api/heartbeat/status` returns a verdict (`ok` / `missing` /
+  `mismatch` / `stale` / …) that an external monitor (with a separate read-only monitor
+  token) can poll to alert when the expected alarm is not set on the phone.
+- **Self-hosted updates** — optional update feed (`version.json` + SHA-256- and
+  signature-verified APK downloads; active only when both the update URL and the pinned
+  signer SHA-256 are configured).
 - **Optional Cloudflare Access** — send service-token headers so the API sits behind
   Cloudflare Access.
-- **Optional certificate pinning** — SPKI SHA-256 pins baked in at build time.
+- **Certificate pinning (on by default)** — SPKI SHA-256 root pins for the public CA
+  families (Let's Encrypt, Google Trust Services, SSL.com, GlobalSign) with mandatory
+  hostname verification on every HTTPS connection; override for a private CA via
+  `CALALARM_CERT_PINS`.
 - **Log upload** — the app can upload its sanitized in-app log buffer to `POST /api/log`
   for remote debugging.
 - **Privacy-conscious by design** — no analytics, no ads, no cleartext traffic, tokens and
-  credentials stored in `EncryptedSharedPreferences` (Android Keystore).
+  credentials stored in `EncryptedSharedPreferences` (Android Keystore); alarm data in
+  device-protected storage for direct-boot reliability.
 
 ## Screenshots
 

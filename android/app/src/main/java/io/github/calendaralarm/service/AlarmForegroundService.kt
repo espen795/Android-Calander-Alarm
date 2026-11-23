@@ -43,15 +43,15 @@ private const val TAG = "AlarmForegroundService"
  * - MediaPlayer with USAGE_ALARM audio attributes (not killable)
  * - Vibrator with continuous pattern
  * - Partial WakeLock (30 min timeout) so the CPU stays awake
- * - Audio focus with AUDIOFOCUS_GAIN_TRANSIENT
+ * - Audio focus met AUDIOFOCUS_GAIN_TRANSIENT
  * - START_STICKY so Android restarts the service if it gets killed
  *
- * Samsung S24 / Android 15 compatibiliteit:
+ * Samsung S24 / Android 15 compatibility:
  * - foregroundServiceType=mediaPlayback — Samsung One UI respecteert dit type
  * - FOREGROUND_SERVICE_MEDIA_PLAYBACK permission (Android 14+ verplicht)
  * - startForeground() met FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK op Android 10+
  *
- * Manifest registratie:
+ * Manifest registration:
  * <service
  *     android:name=".service.AlarmForegroundService"
  *     android:exported="false"
@@ -62,14 +62,14 @@ class AlarmForegroundService : Service() {
     companion object {
         const val ACTION_START_ALARM = "io.github.calendaralarm.action.START_ALARM_SERVICE"
         const val ACTION_STOP_ALARM = "io.github.calendaralarm.action.STOP_ALARM_SERVICE"
-        const val ACTION_START_SILENT_ALARM = "io.github.calendaralarm.action.START_SILENT_ALARM_SERVICE"
         const val EXTRA_ALARM_ID = "extra_alarm_id"
         const val EXTRA_TIME_LABEL = "extra_time_label"
         const val EXTRA_ALARM_LABEL = "extra_alarm_label"
         const val EXTRA_SILENT = "extra_silent"  // v2.6.11: Silent mode — no sound, only vibration + fullscreen
 
-        // v2.5.7: Aparte notification ID voor alarm service
-        private const val NOTIFICATION_ID = CalendarAlarmApp.NOTIFICATION_ID_ALARM_SERVICE
+        // v2.5.7: Separate notification ID for alarm service
+        // P1 review#17: from the central register (4100 — same number, now claimed in the 4000 block)
+        private const val NOTIFICATION_ID = NotificationIds.ALARM_SERVICE
 
         // v2.5.7 PM fix CRIT-02: Persist alarm state for START_STICKY recovery after process kill
         private const val PREFS_NAME = "alarm_service_state"
@@ -85,8 +85,8 @@ class AlarmForegroundService : Service() {
          *
          * @param context Application context
          * @param alarmId ID of the alarm (for snooze/dismiss broadcasts)
-         * @param timeLabel Time label (e.g. "07:30") for the notification
-         * @param alarmLabel Label of the alarm for the notification
+         * @param timeLabel Time label (e.g. "07:30") for in the notification
+         * @param alarmLabel Label of the alarm for in the notification
          */
         fun start(context: Context, alarmId: Int, timeLabel: String, alarmLabel: String) {
             val intent = Intent(context, AlarmForegroundService::class.java).apply {
@@ -104,31 +104,6 @@ class AlarmForegroundService : Service() {
                 AppLogger.i(TAG, "AlarmForegroundService start requested (alarmId=$alarmId, time=$timeLabel)")
             } catch (e: Exception) {
                 AppLogger.e(TAG, "Failed to start AlarmForegroundService: ${e.message}")
-            }
-        }
-
-        /**
-         * v2.6.11: Start the alarm foreground service in SILENT mode.
-         * Shows fullscreen activity + vibration, but NO sound.
-         * For testing the alarm without annoying sound.
-         */
-        fun startSilent(context: Context, alarmId: Int, timeLabel: String, alarmLabel: String) {
-            val intent = Intent(context, AlarmForegroundService::class.java).apply {
-                action = ACTION_START_SILENT_ALARM
-                putExtra(EXTRA_ALARM_ID, alarmId)
-                putExtra(EXTRA_TIME_LABEL, timeLabel)
-                putExtra(EXTRA_ALARM_LABEL, alarmLabel)
-                putExtra(EXTRA_SILENT, true)
-            }
-            try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    context.startForegroundService(intent)
-                } else {
-                    context.startService(intent)
-                }
-                AppLogger.i(TAG, "AlarmForegroundService SILENT start requested (alarmId=$alarmId, time=$timeLabel)")
-            } catch (e: Exception) {
-                AppLogger.e(TAG, "Failed to start AlarmForegroundService (silent): ${e.message}")
             }
         }
 
@@ -172,6 +147,14 @@ class AlarmForegroundService : Service() {
     // v2.6.11: Silent mode — no sound, only vibration + fullscreen
     @Volatile private var isSilentMode: Boolean = false
 
+    // Re-review: true between startAlarm() and stopAlarm(); guard for posted fallback runnables
+    @Volatile private var ringingActive: Boolean = false
+
+    // v2.7.0: power button while ringing = dismiss/snooze (KEYCODE_POWER does not reach the app)
+    private var powerButtonWatcher: PowerButtonWatcher? = null
+    // P1 review#8: start time of the ringing (for the <10s snooze guard)
+    @Volatile private var ringingStartedAt = 0L
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -184,22 +167,13 @@ class AlarmForegroundService : Service() {
                 startAlarm()
                 AppLogger.i(TAG, "AlarmForegroundService started (alarmId=$currentAlarmId, time=$currentTimeLabel)")
             }
-            ACTION_START_SILENT_ALARM -> {
-                // v2.6.11: Silent mode — test alarm without sound
-                currentAlarmId = intent.getIntExtra(EXTRA_ALARM_ID, -1)
-                currentTimeLabel = intent.getStringExtra(EXTRA_TIME_LABEL) ?: ""
-                currentAlarmLabel = intent.getStringExtra(EXTRA_ALARM_LABEL) ?: ""
-                isSilentMode = intent.getBooleanExtra(EXTRA_SILENT, true)
-                AppLogger.i(TAG, "AlarmForegroundService SILENT started (alarmId=$currentAlarmId, time=$currentTimeLabel)")
-                startAlarm()
-            }
             ACTION_STOP_ALARM -> {
                 stopAlarm()
                 AppLogger.i(TAG, "AlarmForegroundService stopping via action")
             }
             else -> {
-                // v2.5.7 PM fix CRIT-02: Service restarted after kill by system — restore state from prefs
-                val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                // v2.5.7 PM fix CRIT-02: Service restart after kill by system — restore state from prefs
+                val prefs = io.github.calendaralarm.data.DeviceProtectedStorage.prefs(this, PREFS_NAME)  // P1 #1: DP (service draait vóór unlock)
                 val savedId = prefs.getInt(KEY_ACTIVE_ALARM_ID, -1)
                 if (savedId != -1) {
                     currentAlarmId = savedId
@@ -213,7 +187,7 @@ class AlarmForegroundService : Service() {
                 }
             }
         }
-        return START_STICKY // Restart service if system kills it
+        return START_STICKY // Restart service if the system kills it
     }
 
     override fun onDestroy() {
@@ -226,7 +200,7 @@ class AlarmForegroundService : Service() {
      * v2.6.0: Load configurable options from SharedPreferences.
      */
     private fun loadAlarmSettings() {
-        val prefs = getSharedPreferences(CalendarAlarmApp.PREFS_ALARM_SETTINGS, Context.MODE_PRIVATE)
+        val prefs = io.github.calendaralarm.data.DeviceProtectedStorage.prefs(this, CalendarAlarmApp.PREFS_ALARM_SETTINGS)  // P1 #1: DP — non-secret alarm settings
         volumeStartLevel = prefs.getFloat(CalendarAlarmApp.PREF_VOLUME_START_LEVEL, 0.3f)
         volumeBuildUpDurationMs = prefs.getLong(CalendarAlarmApp.PREF_VOLUME_BUILD_UP_DURATION, 30000)
         isVibrationEnabled = prefs.getBoolean(CalendarAlarmApp.PREF_VIBRATION_ENABLED, true)
@@ -257,11 +231,13 @@ class AlarmForegroundService : Service() {
      * v2.6.11: In silent mode NO sound is started, only vibration + fullscreen.
      */
     private fun startAlarm() {
-        // v2.6.0: Load configurable options
+        ringingActive = true
+        // v2.6.0: Laad instelbare opties
         loadAlarmSettings()
 
         // v2.5.7 PM fix CRIT-02: Persist state for START_STICKY recovery
-        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().apply {
+        // P1 #1: DP storage (service draait vóór unlock)
+        io.github.calendaralarm.data.DeviceProtectedStorage.prefs(this, PREFS_NAME).edit().apply {
             putInt(KEY_ACTIVE_ALARM_ID, currentAlarmId)
             putString(KEY_TIME_LABEL, currentTimeLabel)
             putString(KEY_ALARM_LABEL, currentAlarmLabel)
@@ -289,6 +265,51 @@ class AlarmForegroundService : Service() {
         if (isVibrationEnabled) {
             startVibration()
         }
+
+        // 6. v2.7.0: power button → snooze/dismiss (setting), also without visible activity
+        // P1 review#8: pass how long we have been ringing + decision callback that on
+        // SNOOZE_INSTEAD_OF_DISMISS sends snooze instead of dismiss (<10s ringing).
+        if (powerButtonWatcher == null) {
+            ringingStartedAt = android.os.SystemClock.elapsedRealtime()
+            powerButtonWatcher = PowerButtonWatcher(
+                context = this,
+                onPowerButton = { onHardwareButton("power") },
+                onPowerButtonDecision = { outcome ->
+                    if (outcome == PowerButtonDecision.Outcome.SNOOZE_INSTEAD_OF_DISMISS) {
+                        onHardwareButton("power-snooze")
+                    } else {
+                        onHardwareButton("power")
+                    }
+                },
+                ringingForMs = { android.os.SystemClock.elapsedRealtime() - ringingStartedAt }
+            ).also { it.start() }
+        }
+    }
+
+    /**
+     * v2.7.0: Physical button while ringing → same path as the buttons in the screen/the
+     * notification (OwnedAlarmReceiver), so snooze/dismiss/re-arm logic stays in one place.
+     */
+    private fun onHardwareButton(source: String) {
+        val alarmId = currentAlarmId
+        if (alarmId == -1) {
+            AppLogger.w(TAG, "Hardware button ($source) without alarmId — stopping service")
+            stopAlarm()
+            stopSelf()
+            return
+        }
+        // P1 review#8: "power-snooze" = SCREEN_OFF within 10s of ringing with setting
+        // "dismiss" → force SNOOZE (too fast to be intentional).
+        val action = if (source == "power-snooze") {
+            OwnedAlarmReceiver.ACTION_SNOOZE
+        } else {
+            OwnedAlarmReceiver.hardwareButtonAction(this, alarmId)
+        }
+        AppLogger.i(TAG, "Hardware button ($source) → $action (alarmId=$alarmId)")
+        sendBroadcast(Intent(this, OwnedAlarmReceiver::class.java).apply {
+            this.action = action
+            putExtra(OwnedAlarmReceiver.EXTRA_ALARM_ID, alarmId)
+        })
     }
 
     /**
@@ -296,10 +317,16 @@ class AlarmForegroundService : Service() {
      */
     private fun stopAlarm() {
         // v2.5.7 PM fix CRIT-02: Clear persisted state
-        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+        // P1 #1: DP storage (service draait vóór unlock)
+        io.github.calendaralarm.data.DeviceProtectedStorage.prefs(this, PREFS_NAME).edit()
             .remove(KEY_ACTIVE_ALARM_ID)
             .apply()
 
+        // Re-review fix: discard posted fallback/volume runnables before we stop
+        ringingActive = false
+        handler.removeCallbacksAndMessages(null)
+        powerButtonWatcher?.stop()
+        powerButtonWatcher = null
         stopMediaPlayer()
         stopVibration()
         releaseWakeLock()
@@ -334,7 +361,7 @@ class AlarmForegroundService : Service() {
 
     /**
      * Build the ongoing notification for the alarm service.
-     * Shows "⏰ Alarm running: {timeLabel}" with snooze/dismiss actions.
+     * Shows "⏰ Alarm ringing: {timeLabel}" with snooze/dismiss actions.
      *
      * v2.5.13 Story 1: Full-screen intent → AlarmRingingActivity for lock screen.
      */
@@ -378,9 +405,9 @@ class AlarmForegroundService : Service() {
         )
 
         val title = if (currentTimeLabel.isNotEmpty()) {
-            "⏰ Alarm running: $currentTimeLabel"
+            "⏰ Alarm ringing: $currentTimeLabel"
         } else {
-            "⏰ Alarm running"
+            "⏰ Alarm ringing"
         }
 
         val text = if (currentAlarmLabel.isNotEmpty()) {
@@ -414,7 +441,7 @@ class AlarmForegroundService : Service() {
                 @Suppress("DEPRECATION")
                 stopForeground(true)
             }
-            // Cancel notification (in case stopForeground doesn't do it)
+            // Cancel notification (in case stopForeground does not do it)
             try {
                 NotificationManagerCompat.from(this).cancel(NOTIFICATION_ID)
             } catch (_: Exception) {}
@@ -518,7 +545,7 @@ class AlarmForegroundService : Service() {
     // --- MediaPlayer ---
 
     /**
-     * v2.6.0: Start volume build-up (gradually increasing the volume).
+     * v2.6.0: Start volume build-up (gradually building up the volume).
      */
     private fun startVolumeBuildUp() {
         if (volumeBuildUpDurationMs <= 0) return
@@ -546,12 +573,35 @@ class AlarmForegroundService : Service() {
         })
     }
 
-    private fun startMediaPlayer() {
-        try {
-            stopMediaPlayer() // Stop first if we already have one
+    // B5: index in the fallback chain — on error of the current URI we move on
+    private var soundChainIndex = 0
 
+    private fun startMediaPlayer() {
+        stopMediaPlayer() // Stop first if we already have one
+        soundChainIndex = 0
+        startMediaPlayerAt(0)
+    }
+
+    private fun startMediaPlayerAt(index: Int) {
+        // Re-review fix: a posted fallback runnable may not start sound anymore after dismiss/snooze
+        if (!ringingActive || isSilentMode) return
+        // B5 (review): fallback chain — own sound → system default alarm → bundled raw.
+        // A content:// URI can fail before the first unlock; then we fall through.
+        val chain = AlarmSoundFallback.fallbackChain(
+            configuredSoundUri = run {
+                val s = alarmSoundUri.toString()
+                // if the configured URI equals the default, skip (duplicate in chain)
+                if (s.contains("DEFAULT_ALARM_ALERT_URI") || s.isEmpty()) null else alarmSoundUri
+            }
+        )
+        if (index >= chain.size) {
+            AppLogger.e(TAG, "B5: all sound sources failed — vibration only (last resort)")
+            return
+        }
+        val uri = chain[index]
+        try {
             val player = MediaPlayer().apply {
-                setDataSource(this@AlarmForegroundService, alarmSoundUri)
+                setDataSource(this@AlarmForegroundService, uri)
                 setAudioAttributes(
                     AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_ALARM)
@@ -566,17 +616,19 @@ class AlarmForegroundService : Service() {
                 setOnPreparedListener { mp ->
                     try {
                         mp.start()
-                        AppLogger.i(TAG, "MediaPlayer prepared and started (startVolume=$volumeStartLevel)")
+                        AppLogger.i(TAG, "MediaPlayer started (source ${index + 1}/${chain.size}: $uri)")
                         // v2.6.0: Start volume build-up after start
                         startVolumeBuildUp()
                     } catch (e: Exception) {
-                        AppLogger.e(TAG, "Failed to start MediaPlayer after prepare: ${e.message}")
+                        AppLogger.e(TAG, "B5: start() failed for $uri: ${e.message} — next source")
+                        onSoundFailed(index)
                     }
                 }
 
-                // v2.5.7: Error listener returns true (error consumed)
+                // B5: on error → next source in the chain
                 setOnErrorListener { _, what, extra ->
-                    AppLogger.e(TAG, "MediaPlayer error: what=$what, extra=$extra")
+                    AppLogger.e(TAG, "B5: MediaPlayer error (what=$what, extra=$extra) for $uri — next source")
+                    onSoundFailed(index)
                     true // Error consumed
                 }
 
@@ -584,10 +636,20 @@ class AlarmForegroundService : Service() {
             }
 
             mediaPlayer = player
-            AppLogger.i(TAG, "MediaPlayer created with prepareAsync() (sound=$alarmSoundUri)")
+            AppLogger.i(TAG, "MediaPlayer prepareAsync (source ${index + 1}/${chain.size}: $uri)")
         } catch (e: Exception) {
-            AppLogger.e(TAG, "Failed to start MediaPlayer: ${e.message}")
+            AppLogger.e(TAG, "B5: setDataSource/prepare failed for $uri: ${e.message} — next source")
+            onSoundFailed(index)
         }
+    }
+
+    /** B5: try the next sound source; at end of chain → log ERROR (vibration remains). */
+    private fun onSoundFailed(failedIndex: Int) {
+        stopMediaPlayer()
+        val next = failedIndex + 1
+        soundChainIndex = next
+        // post on main handler so we do not stay stuck inside the MediaPlayer callback
+        handler.post { startMediaPlayerAt(next) }
     }
 
     private fun stopMediaPlayer() {

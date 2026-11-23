@@ -12,10 +12,13 @@ labels — adapt to your own proxy, e.g. nginx, Caddy, or Cloudflare Tunnel + Ac
 ```bash
 cd server
 
-# 1. Environment: device token + public hostname
+# 1. Environment: device token + public hostname (+ optional monitor token, see below)
 cp .env.example .env
 #   CALALARM_DEVICE_TOKEN=<long random string, e.g. python3 -c "import secrets;print(secrets.token_hex(32))">
+#   CALALARM_MONITOR_TOKEN=<another long random string — optional, read-only, see below>
 #   CALALARM_API_HOST=alarm-api.example.com
+#   FORWARDED_ALLOW_IPS=<IP of your reverse proxy on the external 'proxy' docker network,
+#                        e.g. 172.18.0.2 — find it with: docker network inspect proxy>
 
 # 2. Runtime data directory (the ONLY host path mounted into the container)
 mkdir -p data/logs
@@ -41,9 +44,30 @@ curl -s https://alarm-api.example.com/health
 ```
 
 The container is hardened: non-root user (10001), read-only root filesystem, small tmpfs
-for `/tmp`, and only `./data` mounted writable. The API listens on port 8100 inside the
-container; the reverse proxy routes the public hostname to it (Traefik label example in
-`docker-compose.yml`, including a rate-limit middleware as defense in depth).
+for `/tmp`, **all capabilities dropped** (`cap_drop: ALL`), `no-new-privileges`, memory
+limit 256 MB, PID limit 100, a pure-Python healthcheck, and only `./data` mounted
+writable. The API listens on port 8100 inside the container; the reverse proxy routes the
+public hostname to it (Traefik label example in `docker-compose.yml`, including a
+rate-limit middleware as defense in depth).
+
+### Monitor token & forwarded IPs
+
+- **`CALALARM_MONITOR_TOKEN`** (optional) — a second, read-only bearer token accepted
+  only on `GET /api/heartbeat/status`. Use it on an external monitoring host that should
+  see the alarm verdict (does the phone have tomorrow's expected alarm?) without knowing
+  the device token:
+
+  ```bash
+  curl -s -H "Authorization: Bearer $CALALARM_MONITOR_TOKEN" \
+    https://alarm-api.example.com/api/heartbeat/status
+  # -> {"verdict": "ok" | "missing" | "mismatch" | "stale" | ..., "expected_tomorrow": {...}, ...}
+  ```
+
+  It cannot post heartbeats or read/modify the config. Empty (default) = not configured.
+- **`FORWARDED_ALLOW_IPS`** (required by compose) — the IP of your reverse proxy on the
+  external `proxy` Docker network (an RFC1918 example: `172.18.0.2`). uvicorn only trusts
+  `X-Forwarded-For` from this address, so the per-IP rate limit is not spoofable by
+  clients that reach the container directly. Never set it to `*`.
 
 ## 2. Build the app
 

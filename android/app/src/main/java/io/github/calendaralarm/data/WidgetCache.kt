@@ -14,12 +14,12 @@ import java.util.Locale
  * - Widget reads ONLY simple strings from SharedPreferences
  * - NO kotlinx.serialization in widget (R8 strips serializers in release)
  * - NO complex JSON parsing in BroadcastReceiver
- * - App updates the cache on every alarm change
+ * - App updates cache on every alarm change
  *
  * Why this works:
  * - SharedPreferences.getString() is 100% reliable in BroadcastReceiver
  * - No dependencies, no reflection, no obfuscation issues
- * - Samsung One UI can render this without problems
+ * - Samsung One UI renders this without problems
  */
 object WidgetCache {
 
@@ -28,24 +28,24 @@ object WidgetCache {
     private const val KEY_LAST_UPDATE = "last_update"
 
     private fun prefs(context: Context): SharedPreferences =
-        context.applicationContext.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE)
+        DeviceProtectedStorage.prefs(context, PREFS_FILE)  // P1 #1: DP storage (widget runs before unlock)
 
     /**
-     * Update the cache with the text for the next alarm.
+     * Update the cache with the text for the next upcoming alarm.
      * Called from AlarmRepository on every schedule/cancel.
      *
-     * v2.5.3 PM fix C-02: Use formatNextAlarm() (with enabled/past checks)
+     * v2.5.3 PM fix C-02: use formatNextAlarm() (with enabled/past checks)
      * instead of the old formatAlarmText() — one consistent function.
      *
      * @param context Application context
-     * @param alarm The next alarm, or null if there is none
+     * @param alarm The next upcoming alarm, or null if there is none
      */
     fun updateNextAlarm(context: Context, alarm: AlarmStore.OwnedAlarm?) {
         try {
             val text = formatNextAlarm(alarm)
             prefs(context).edit()
                 .putString(KEY_NEXT_ALARM_TEXT, text)
-                .putLong(KEY_LAST_UPDATE, System.currentTimeMillis())
+                .putLong(KEY_LAST_UPDATE, io.github.calendaralarm.data.AppClock.now())
                 .apply()
         } catch (e: Exception) {
             AppLogger.e("WidgetCache", "Failed to update cache: ${e.message}")
@@ -59,7 +59,7 @@ object WidgetCache {
         try {
             prefs(context).edit()
                 .putString(KEY_NEXT_ALARM_TEXT, text)
-                .putLong(KEY_LAST_UPDATE, System.currentTimeMillis())
+                .putLong(KEY_LAST_UPDATE, io.github.calendaralarm.data.AppClock.now())
                 .apply()
         } catch (e: Exception) {
             AppLogger.e("WidgetCache", "Failed to update cache: ${e.message}")
@@ -76,7 +76,7 @@ object WidgetCache {
     fun formatNextAlarm(alarm: AlarmStore.OwnedAlarm?): String {
         if (alarm == null) return "No alarm scheduled"
         if (!alarm.enabled) return "No alarm scheduled"
-        if (alarm.triggerAtMillis <= System.currentTimeMillis()) return "No alarm scheduled"
+        if (alarm.triggerAtMillis <= io.github.calendaralarm.data.AppClock.now()) return "No alarm scheduled"
 
         val emoji = when (alarm.type) {
             "office" -> "🏢"
@@ -87,7 +87,7 @@ object WidgetCache {
         }
 
         // Determine day display: "today", "tomorrow", or 2-letter weekday
-        val now = Calendar.getInstance()
+        val now = Calendar.getInstance().apply { timeInMillis = io.github.calendaralarm.data.AppClock.now() }
         val alarmCal = Calendar.getInstance().apply { timeInMillis = alarm.triggerAtMillis }
 
         // Check if alarm is tomorrow
@@ -98,7 +98,7 @@ object WidgetCache {
             isSameDay(now, alarmCal) -> "today"
             isTomorrow -> "tomorrow"
             else -> {
-                // Weekday in 2 letters (device locale): Mo, Tu, We, Th, Fr, Sa, Su
+                // Weekday in 2 letters (nl locale): ma, di, wo, do, vr, za, zo
                 val dayFormat = SimpleDateFormat("EE", Locale.getDefault())
                 dayFormat.format(Date(alarm.triggerAtMillis)).take(2)
             }
@@ -115,7 +115,7 @@ object WidgetCache {
     /**
      * v2.5.3 PM fix C-02: formatAlarmText() removed — was inconsistent with formatNextAlarm().
      * Widget now uses formatNextAlarm() via updateNextAlarm().
-     * Emoji for "off" is now consistently 😴 (was 🏖️ in the old version).
+     * Emoji for "off" is now consistent 😴 (was 🏖️ in the old version).
      */
 
     /**

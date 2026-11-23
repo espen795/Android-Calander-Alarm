@@ -63,15 +63,15 @@ def test_cancelled_meetings_are_ignored():
         **kw,
     }
     events = [
-        ev("Kantoor dag geannuleerd", isCancelled=True),
+        ev("Kantoor dag geannuleerd", isCancelled=True),  # PRESERVED: Dutch keywords matched against server data
         ev("Standup", status="cancelled"),
-        ev("Geannuleerd: sync met team"),
-        ev("Echte meeting op kantoor"),  # this one MUST match
+        ev("Geannuleerd: sync met team"),  # PRESERVED: "geannuleerd" is a Dutch keyword the server matches
+        ev("Echte meeting op kantoor"),  # PRESERVED: must still match the "kantoor" keyword
     ]
     config = {"rules": [{"id": "office", "name": "Kantoor", "time": "05:45",
-                          "keywords": ["kantoor", "standup"]}],
+                          "keywords": ["kantoor", "standup"]}],  # PRESERVED: Dutch keyword list
               "default_rule_id": "", "weekend_rule_id": ""}
     rule, conf = m.detect_rule(events, day, config)
-    # Only "Echte meeting op kantoor" counts -> office match, not via cancelled ones
+    # Only the real office meeting counts -> office match, not via cancelled ones
     assert rule["id"] == "office", rule
     assert conf != "high"

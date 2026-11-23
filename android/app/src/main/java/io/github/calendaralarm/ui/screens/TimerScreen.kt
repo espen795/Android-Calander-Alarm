@@ -1,9 +1,6 @@
 package io.github.calendaralarm.ui.screens
 
-import android.app.PendingIntent
 import android.content.Context
-import android.content.Intent
-import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior
 import androidx.compose.foundation.horizontalScroll
@@ -31,25 +28,18 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.app.NotificationCompat
-import androidx.core.app.NotificationManagerCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
-import io.github.calendaralarm.MainActivity
-import io.github.calendaralarm.CalendarAlarmApp
 import io.github.calendaralarm.data.AppLogger
-import io.github.calendaralarm.data.TimerAlarmHelper
-import io.github.calendaralarm.receiver.TimerActionReceiver
-import io.github.calendaralarm.ui.TimerRingingActivity
 import io.github.calendaralarm.ui.theme.CalGreen
 import io.github.calendaralarm.ui.theme.CalGrey
 import io.github.calendaralarm.ui.theme.CalOrange
 import io.github.calendaralarm.ui.theme.CalPurple
 import io.github.calendaralarm.ui.theme.CalRed
 import io.github.calendaralarm.ui.viewmodels.TimerViewModel
-import io.github.calendaralarm.service.TimerForegroundService
+import io.github.calendaralarm.service.TimerRingService
 import java.util.Locale
 import kotlin.math.abs
 
@@ -73,7 +63,7 @@ private const val TAG_UI = "TimerUI"
  * v2.5.6 changes (Timer survives app kill):
  * - ViewModel sync with AlarmManager via TimerScheduler
  * - State persistence via TimerStateStore (SharedPreferences)
- * - Restore indicator when reloaded after app restart
+ * - Restore indicator when reloading after app restart
  * - TimerForegroundService for Samsung OOM killer protection
  * - TimerFireReceiver for alarm handling when the app is dead
  *
@@ -108,27 +98,12 @@ fun TimerScreen(
 
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
 
-    // v2.5.2 Fix 2 + v2.5.3: TimerAlarmHelper for real alarm sound + vibration
-    // v2.5.3: Use shared instance so TimerRingingActivity can stop the alarm
-    val alarmHelper = remember { TimerAlarmHelper.getInstance(context) }
-
-    // v2.5.6 Story 6: Start/stop foreground service for Samsung OOM killer protection
-    LaunchedEffect(uiState.isRunning) {
-        if (uiState.isRunning) {
-            TimerForegroundService.start(context, uiState.remainingMs)
-        } else {
-            TimerForegroundService.stop(context)
-        }
-    }
-
-    // v2.5.3 Story 4: Ongoing notification while timer is running
-    LaunchedEffect(uiState.isRunning) {
-        if (uiState.isRunning) {
-            showTimerNotification(context, uiState.remainingMs)
-        } else {
-            cancelTimerNotification(context)
-        }
-    }
+    // v2.7.0: The UI no longer starts/stops services, notifications, sound or activities.
+    // - Countdown service: TimerViewModel (start/pause/stop)
+    // - Firing (sound + full-screen): TimerFireReceiver.fire() → TimerRingService
+    // Previously, leaving the Timer tab (onDispose) or (re)opening
+    // MainActivity stopped the ringing, and this layer launched a second TimerRingingActivity.
+    val isRinging by TimerRingService.ringing.collectAsStateWithLifecycle()
 
     // v2.5.6 Story 7: Refresh state on resume (e.g. after returning from another app)
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -144,45 +119,6 @@ fun TimerScreen(
         }
     }
 
-    // v2.5.3 Story 5: Launch full-screen activity when timer finishes
-    LaunchedEffect(uiState.isFinished) {
-        if (uiState.isFinished) {
-            val intent = Intent(context, TimerRingingActivity::class.java).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-            }
-            try {
-                context.startActivity(intent)
-                AppLogger.i(TAG_UI, "Launched TimerRingingActivity")
-            } catch (e: Exception) {
-                AppLogger.e(TAG_UI, "Failed to launch TimerRingingActivity: ${e.message}")
-            }
-        }
-    }
-
-    // Wire up the "timer finished" callback (alarm sound + vibration + toast)
-    DisposableEffect(viewModel, alarmHelper) {
-        viewModel.onTimerFinished = {
-            alarmHelper.startAlarm()
-            AppLogger.i(TAG_UI, "Timer completed: ${TimerViewModel.formatDuration(uiState.totalMs)}")
-            Toast.makeText(context, "⏰ Timer expired! Tap to stop", Toast.LENGTH_LONG).show()
-        }
-        onDispose {
-            viewModel.onTimerFinished = null
-            // Stop alarm when leaving the screen
-            alarmHelper.stopAlarm()
-            alarmHelper.release()
-            // v2.5.3: Cancel notification when leaving screen
-            cancelTimerNotification(context)
-        }
-    }
-
-    // Stop alarm when timer is no longer finished (user pressed stop/reset)
-    LaunchedEffect(uiState.isFinished) {
-        if (!uiState.isFinished) {
-            alarmHelper.stopAlarm()
-        }
-    }
-
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -191,7 +127,7 @@ fun TimerScreen(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        // v2.5.6 Story 7: Restore indicator — show banner when the timer was restored after a restart
+        // v2.5.6 Story 7: Restore indicator — show banner when the timer was restored after restart
         if (uiState.isRestored) {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -226,7 +162,7 @@ fun TimerScreen(
             screenWidthDp = screenWidthDp
         )
 
-        // ── Preset buttons (v2.5.4 Story 3: "Snelkiezer" titel verwijderd) ──
+        // ── Preset buttons (v2.5.4 Story 3: "quick picker" title removed) ──
         val presets = listOf(
             5 to "5 min",
             10 to "10 min",
@@ -278,8 +214,14 @@ fun TimerScreen(
             remainingMs = uiState.remainingMs,
             totalMs = uiState.totalMs,
             onStartPause = { viewModel.toggleStartPause() },
-            onReset = { viewModel.reset() },
-            onStop = { viewModel.stop() }
+            onReset = {
+                if (isRinging) TimerRingService.stop(context)
+                viewModel.reset()
+            },
+            onStop = {
+                if (isRinging) TimerRingService.stop(context)
+                viewModel.stop()
+            }
         )
     }
 }
@@ -313,7 +255,7 @@ private fun TimerDisplay(
                 else -> CalOrange
             }
         )
-        // v2.5.4 Story 3: Only show status when running or finished (no "ready")
+        // v2.5.4 Story 3: Only show a status when running or finished (no "ready")
         if (isRunning || isFinished) {
             Text(
                 text = if (isRunning) "running…" else "done!",
@@ -655,84 +597,5 @@ private fun TimerControls(
                 Text("Stop")
             }
         }
-    }
-}
-
-// ── v2.5.3 Story 4: Notification helpers ──────────────────────────
-// v2.5.3 PM fix C-01: Gebruik centrale constante uit CalendarAlarmApp
-private val TIMER_NOTIFICATION_ID get() = CalendarAlarmApp.NOTIFICATION_ID_TIMER
-
-/**
- * v2.5.3 PM fix: Check notification permission (Android 13+ / Samsung S24).
- * Without permission, NotificationManagerCompat.notify() fails silently.
- */
-private fun hasNotificationPermission(context: Context): Boolean {
-    return if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-        androidx.core.content.ContextCompat.checkSelfPermission(
-            context, android.Manifest.permission.POST_NOTIFICATIONS
-        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-    } else {
-        true
-    }
-}
-
-/**
- * Show an ongoing notification while the timer is running.
- * Content: "⏱️ Timer: {remaining} left" with a "Stop" action.
- */
-private fun showTimerNotification(context: Context, remainingMs: Long) {
-    // v2.5.3 PM fix: Permission check — Android 13+ requires POST_NOTIFICATIONS
-    if (!hasNotificationPermission(context)) {
-        AppLogger.w(TAG_UI, "No POST_NOTIFICATIONS permission — skipping timer notification")
-        return
-    }
-    try {
-        val remainingText = TimerViewModel.formatDuration(remainingMs)
-
-        // Tap → open MainActivity
-        val contentIntent = PendingIntent.getActivity(
-            context, 0,
-            Intent(context, MainActivity::class.java).apply {
-                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        // Stop action → broadcast to TimerActionReceiver
-        val stopIntent = PendingIntent.getBroadcast(
-            context, 0,
-            Intent(context, TimerActionReceiver::class.java).apply {
-                action = TimerActionReceiver.ACTION_STOP_TIMER
-            },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val notification = NotificationCompat.Builder(context, CalendarAlarmApp.CHANNEL_TIMER)
-            .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
-            .setContentTitle("⏱️ Timer")
-            .setContentText("$remainingText left")
-            .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setContentIntent(contentIntent)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopIntent)
-            .setAutoCancel(false)
-            .build()
-
-        NotificationManagerCompat.from(context).notify(TIMER_NOTIFICATION_ID, notification)
-        AppLogger.i(TAG_UI, "Timer notification shown: $remainingText left")
-    } catch (e: Exception) {
-        AppLogger.e(TAG_UI, "Failed to show timer notification: ${e.message}")
-    }
-}
-
-/**
- * Cancel the timer notification.
- */
-private fun cancelTimerNotification(context: Context) {
-    try {
-        NotificationManagerCompat.from(context).cancel(TIMER_NOTIFICATION_ID)
-        AppLogger.i(TAG_UI, "Timer notification cancelled")
-    } catch (e: Exception) {
-        AppLogger.e(TAG_UI, "Failed to cancel timer notification: ${e.message}")
     }
 }

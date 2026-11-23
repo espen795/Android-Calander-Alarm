@@ -20,37 +20,37 @@ import io.github.calendaralarm.ui.AlarmRingingActivity
 object AlarmNotificationHelper {
 
     /**
-     * v2.6.12: Central notification policy (design notification-policy-2026-11-12).
+     * v2.6.12: Centrale notificatie-policy (design notification-policy-2026-11-12).
      *
      * ALL alarm notifications go through [notifyAlarmEvent]. The policy lives in one place:
-     * - SET / CHANGED / REMOVED: only allowed when the caller has deduped
-     *   (AlarmRepository state-key, or AlarmSyncWorker plan-vs-store diff). The funnel
-     *   trusts that — NEVER call these events without dedup.
+     * - SET / CHANGED / REMOVED: only allowed if the caller did dedup
+     *   (AlarmRepository state key, or AlarmSyncWorker plan-vs-store diff). The funnel
+     *   relies on that — NEVER call these events without dedup.
      * - PRE_ALARM / RINGING: always allowed (E2 + mandatory during ringing).
      * - SYNC_FAILED: always allowed (error message, no spam).
      * - UPDATE: unchanged behavior (outside the scope of the policy).
      */
     enum class AlarmEvent { SET, CHANGED, REMOVED, PRE_ALARM, RINGING, SYNC_FAILED, UPDATE }
 
-    // v2.6.13 L9: SharedPreferences for the content-dedup in the funnel (safety net)
+    // v2.6.13 L9: SharedPreferences for the content dedup in the funnel (safety net)
     private const val FUNNEL_PREFS_NAME = "notif_funnel"
     private const val FUNNEL_KEY_LAST_ALARM_EVENT = "last_alarm_event"
 
     /**
-     * v2.6.12: The only place that decides WHICH event may be reported.
+     * v2.6.12: The only place where it is decided WHICH event may be reported.
      */
     fun policyAllows(event: AlarmEvent): Boolean = when (event) {
         AlarmEvent.SET, AlarmEvent.CHANGED, AlarmEvent.REMOVED -> true // dedup upstream (repository/sync-worker)
-        AlarmEvent.PRE_ALARM, AlarmEvent.RINGING -> true              // E2 + ringing always
-        AlarmEvent.SYNC_FAILED -> true                                // error messages always
-        AlarmEvent.UPDATE -> true                                     // unchanged
+        AlarmEvent.PRE_ALARM, AlarmEvent.RINGING -> true              // E2 + ringing altijd
+        AlarmEvent.SYNC_FAILED -> true                                // foutmeldingen altijd
+        AlarmEvent.UPDATE -> true                                     // ongewijzigd
     }
 
     /**
      * v2.6.12: Central funnel for all alarm notifications.
      *
-     * v2.6.13 (L9, safety net): for SET/CHANGED/REMOVED a content-dedup in SharedPreferences
-     * `notif_funnel` — key `"$event|$time|$label"`. Substantively identical to the previous notification
+     * v2.6.13 (L9, safety net): for SET/CHANGED/REMOVED a content dedup in SharedPreferences
+     * `notif_funnel` — key `"$event|$time|$label"`. Content-identical to the previous notification
      * → return false (silent). This is defense-in-depth ON TOP OF the upstream dedup (L1), not
      * a replacement for it.
      *
@@ -67,12 +67,12 @@ object AlarmNotificationHelper {
             AppLogger.d("AlarmNotificationHelper", "Policy blocks event=$event — no notification")
             return false
         }
-        // v2.6.13 L9: content-dedup for alarm events (safety net)
+        // v2.6.13 L9: content dedup for alarm events (safety net)
         if (event in setOf(AlarmEvent.SET, AlarmEvent.CHANGED, AlarmEvent.REMOVED)) {
             val key = "$event|$time|$label"
-            val funnelPrefs = context.getSharedPreferences(FUNNEL_PREFS_NAME, Context.MODE_PRIVATE)
+            val funnelPrefs = io.github.calendaralarm.data.DeviceProtectedStorage.prefs(context, FUNNEL_PREFS_NAME)  // P1 #1: DP (used in receivers before unlock)
             if (funnelPrefs.getString(FUNNEL_KEY_LAST_ALARM_EVENT, null) == key) {
-                AppLogger.d("AlarmNotificationHelper", "L9 content-dedup: identical event=$event — silent")
+                AppLogger.d("AlarmNotificationHelper", "L9 content dedup: identical event=$event — silent")
                 return false
             }
             funnelPrefs.edit().putString(FUNNEL_KEY_LAST_ALARM_EVENT, key).apply()
@@ -88,14 +88,14 @@ object AlarmNotificationHelper {
                 AlarmEvent.RINGING -> showAlarmRingingNotification(context, time, label, alarmId)
                 AlarmEvent.PRE_ALARM -> {
                     // Pre-alarm is rendered by PreAlarmReceiver itself (own ID scheme + actions);
-                    // here only the policy check.
+                    // only the policy check here.
                     AppLogger.d("AlarmNotificationHelper", "PRE_ALARM allowed (rendered by PreAlarmReceiver)")
                 }
                 AlarmEvent.UPDATE -> showUpdateNotification(context, time, label)
             }
         } catch (e: Exception) {
-            // A failing render (e.g. missing resource in test/Robolectric) must NEVER crash the
-            // caller — dedup state is already written, so return true (decided).
+            // A failing render (e.g. missing resource in test/Robolectric) must NEVER
+            // crash the caller — dedup state is already written, so return true (decided).
             AppLogger.e("AlarmNotificationHelper", "notifyAlarmEvent($event) render failed: ${e.message}")
         }
         return true
@@ -120,16 +120,19 @@ object AlarmNotificationHelper {
             .build()
 
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        notificationManager.notify(CalendarAlarmApp.NOTIFICATION_ID_ALARM, notification)
+        notificationManager.notify(NotificationIds.ALARM, notification)
     }
 
     /**
-     * v2.6.12: "Alarm changed" notification (E3) — per-alarm ID so they don't collide.
+     * v2.6.12: "Alarm changed" notification (E3) — per-alarm ID so they do not collide.
+     * P1 review#17: ID now comes from the central register (CHANGED_BASE + alarmId).
      */
     fun showAlarmChangedNotification(context: Context, time: String, label: String, alarmId: Int = -1) {
         if (!hasNotificationPermission(context)) return
 
-        val notificationId = if (alarmId >= 0) alarmId + 10000 else CalendarAlarmApp.NOTIFICATION_ID_ALARM + 2
+        // N-f: per-alarm via tag+id; fixed fallback ID without tag
+        val notificationId = if (alarmId >= 0) NotificationIds.changed(alarmId) else NotificationIds.ALARM_FALLBACK
+        val tag = if (alarmId >= 0) NotificationIds.TAG_CHANGED else null
 
         val intent = Intent(context, MainActivity::class.java)
         val pendingIntent = PendingIntent.getActivity(
@@ -147,7 +150,8 @@ object AlarmNotificationHelper {
             .build()
 
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        notificationManager.notify(notificationId, notification)
+        if (tag != null) notificationManager.notify(tag, notificationId, notification)
+        else notificationManager.notify(notificationId, notification)
     }
 
     /**
@@ -156,7 +160,8 @@ object AlarmNotificationHelper {
     fun showAlarmRemovedNotification(context: Context, time: String, label: String, alarmId: Int = -1) {
         if (!hasNotificationPermission(context)) return
 
-        val notificationId = if (alarmId >= 0) alarmId + 10000 else CalendarAlarmApp.NOTIFICATION_ID_ALARM + 3
+        val notificationId = if (alarmId >= 0) NotificationIds.removed(alarmId) else NotificationIds.ALARM_FALLBACK + 1
+        val tag = if (alarmId >= 0) NotificationIds.TAG_REMOVED else null
 
         val intent = Intent(context, MainActivity::class.java)
         val pendingIntent = PendingIntent.getActivity(
@@ -175,7 +180,8 @@ object AlarmNotificationHelper {
             .build()
 
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        notificationManager.notify(notificationId, notification)
+        if (tag != null) notificationManager.notify(tag, notificationId, notification)
+        else notificationManager.notify(notificationId, notification)
     }
 
     /**
@@ -240,19 +246,22 @@ object AlarmNotificationHelper {
             .build()
 
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        notificationManager.notify(CalendarAlarmApp.NOTIFICATION_ID_RINGING + alarmId, notification)
+        // P1 review#17 + N-f: notify(tag, id) — tag=ringing, id=alarmId (never a collision on high IDs)
+        notificationManager.notify(NotificationIds.TAG_RINGING, NotificationIds.ringing(alarmId), notification)
     }
 
     fun cancelAlarmRingingNotification(context: Context, alarmId: Int = -1) {
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         if (alarmId >= 0) {
-            // NC-02 fix: Use the same ID scheme as showAlarmRingingNotification
-            notificationManager.cancel(CalendarAlarmApp.NOTIFICATION_ID_RINGING + alarmId)
+            // Huidige scheme (tag+id)
+            notificationManager.cancel(NotificationIds.TAG_RINGING, NotificationIds.ringing(alarmId))
+            // N-f backwards-compat: also cancel legacy fixed IDs (4001+id, 4200+id)
+            NotificationIds.legacyRingingIds(alarmId).forEach { notificationManager.cancel(it) }
         } else {
-            // Cancel all ringing notifications (fallback)
-            // We can't enumerate, but we can cancel a range of likely IDs
-            for (id in 0..1000) {
-                notificationManager.cancel(CalendarAlarmApp.NOTIFICATION_ID_RINGING + id)
+            // Cancel all ringing notifications (fallback) — tag scheme + legacy range
+            for (id in 0..2000) {
+                notificationManager.cancel(NotificationIds.TAG_RINGING, id)
+                NotificationIds.legacyRingingIds(id).forEach { notificationManager.cancel(it) }
             }
         }
     }
@@ -274,11 +283,11 @@ object AlarmNotificationHelper {
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
-            .setOnlyAlertOnce(true)  // v2.6.13 L7: update notification silently updates on repeat
+            .setOnlyAlertOnce(true)  // v2.6.13 L7: update notification updates silently on repeat
             .build()
 
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        notificationManager.notify(CalendarAlarmApp.NOTIFICATION_ID_UPDATE, notification)
+        notificationManager.notify(NotificationIds.UPDATE, notification)
     }
 
     fun showSyncFailedNotification(context: Context, reason: String) {
@@ -297,11 +306,11 @@ object AlarmNotificationHelper {
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setOnlyAlertOnce(true)  // v2.6.13 L6: no heads-up/sound on repeat of same message
+            .setOnlyAlertOnce(true)  // v2.6.13 L6: no heads-up/sound on repeat of the same message
             .build()
 
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        notificationManager.notify(CalendarAlarmApp.NOTIFICATION_ID_ALARM + 1, notification)
+        notificationManager.notify(NotificationIds.SYNC_FAILED, notification)
     }
 
     fun showSyncSuccessNotification(context: Context, wakeTime: String, label: String, date: String) {

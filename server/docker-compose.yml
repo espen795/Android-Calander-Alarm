@@ -11,17 +11,37 @@ services:
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=16m
+    # #32/#33: least-privilege container flags
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # #32/#33: resource limits (memory + pids) against DoS/runaway
+    mem_limit: 256m
+    pids_limit: 100
     environment:
       - CALALARM_DEVICE_TOKEN=${CALALARM_DEVICE_TOKEN}
+      - CALALARM_MONITOR_TOKEN=${CALALARM_MONITOR_TOKEN:-}
       - CALALARM_WORKSPACE=/data
+      # #20/B1: uvicorn reads FORWARDED_ALLOW_IPS itself (env). Value = the IP
+      # of the Traefik proxy on the external 'proxy' network, so that uvicorn
+      # only trusts X-Forwarded-For from that one proxy. Set FORWARDED_ALLOW_IPS
+      # in .env to the IP of your proxy (docker network inspect proxy).
+      # Note: without forwardedHeaders.trustedIPs at Traefik the
+      # client IP in the app is still not resolved per real client — see Dockerfile.
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:?set to the IP of your reverse proxy on the proxy network}
     volumes:
       - ./data:/data:rw
     networks:
       - proxy
-    # No `ports:` section on purpose: the container is reachable only via the
-    # internal `proxy` network through the reverse proxy below.
-    # NOTE: replace the traefik.* labels with your own reverse-proxy routing
-    # (the labels below are an example for a Traefik-based edge).
+    # #32/#33: healthcheck without curl (no longer in the image) —
+    # pure Python one-liner via stdlib urllib (no curl needed).
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=5); sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=proxy"
@@ -30,7 +50,7 @@ services:
       - "traefik.http.routers.calendar-alarm-api.tls=true"
       - "traefik.http.routers.calendar-alarm-api.priority=25"
       - "traefik.http.services.calendar-alarm-api.loadbalancer.server.port=8100"
-      # Rate limiting at the proxy level (defense in depth — the app also limits at 10/min)
+      # Rate limiting at Traefik level (defense in depth — app also limits at 10/min)
       - "traefik.http.middlewares.calendar-alarm-api-ratelimit.ratelimit.average=20"
       - "traefik.http.middlewares.calendar-alarm-api-ratelimit.ratelimit.burst=30"
       - "traefik.http.routers.calendar-alarm-api.middlewares=calendar-alarm-api-ratelimit"

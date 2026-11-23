@@ -36,6 +36,7 @@ class AlarmRepositoryTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
         context.getSharedPreferences("calendar_alarm_store", Context.MODE_PRIVATE)
             .edit().clear().commit()
+        io.github.calendaralarm.data.DeviceProtectedStorage.prefs(context, "calendar_alarm_store").edit().clear().commit()
         repo = AlarmRepository(context)
     }
 

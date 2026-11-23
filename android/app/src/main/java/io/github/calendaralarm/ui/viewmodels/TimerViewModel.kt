@@ -14,6 +14,8 @@ import kotlinx.coroutines.launch
 import io.github.calendaralarm.data.AppLogger
 import io.github.calendaralarm.data.TimerScheduler
 import io.github.calendaralarm.data.TimerStateStore
+import io.github.calendaralarm.receiver.TimerFireReceiver
+import io.github.calendaralarm.service.TimerForegroundService
 
 private const val TAG = "TimerViewModel"
 
@@ -40,9 +42,11 @@ data class TimerUiState(
  * - Holds all timer state (survives tab switches and configuration changes)
  * - Uses SystemClock.elapsedRealtime() for monotonic time tracking (in-memory)
  * - Runs a coroutine loop to update remaining time while running
- * - Emits timer-finished events via [onTimerFinished] callback
+ * - v2.7.0: At 0 only UI state + TimerFireReceiver.fire() (idempotent). Sound and
+ *   full-screen activity are fully owned by TimerRingService — the UI layer no
+ *   longer starts sound or activities itself (that caused duplicate ringing screens).
  *
- * v2.5.6: AlarmManager integration — timer survives app kill and reboot:
+ * v2.5.6: AlarmManager integratie — timer overleeft app kill en reboot:
  * - On start(): save state in TimerStateStore + schedule AlarmManager via TimerScheduler
  * - On pause(): update state + cancel AlarmManager entry
  * - On stop()/reset(): clear state + cancel AlarmManager
@@ -52,7 +56,7 @@ data class TimerUiState(
  * v2.5.0: Extracted from TimerScreen to separate UI from business logic.
  */
 class TimerViewModel(
-    private val context: Context? = null  // v2.5.6: optional for AlarmManager sync (null in tests)
+    context: Context? = null  // v2.7.0: plain param (no Activity leak); v2.5.6: optional for AlarmManager sync (null in tests)
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(TimerUiState())
@@ -63,7 +67,7 @@ class TimerViewModel(
 
     /**
      * v2.5.6: Wall clock timestamp (System.currentTimeMillis) when the timer should end.
-     * This is the value saved in TimerStateStore — wall clock survives reboot.
+     * This is the value stored in TimerStateStore — wall clock survives a reboot.
      */
     private var endTimeWallClock: Long = 0L
 
@@ -80,15 +84,28 @@ class TimerViewModel(
      */
     private val scheduler: TimerScheduler? = context?.let { TimerScheduler(it) }
 
+    private val appContext: Context? = context?.applicationContext
+
     /**
-     * Callback invoked when the timer finishes.
-     * Set by the UI layer to trigger vibration, toast, etc.
+     * v2.7.0: Timer is finished — let it fire (idempotently) via TimerFireReceiver.
+     * If the AlarmManager receiver already fired, this is a no-op.
      */
-    var onTimerFinished: (() -> Unit)? = null
+    private fun fireFinished(source: String) {
+        val ctx = appContext ?: return
+        TimerFireReceiver.fire(ctx, source)
+    }
+
+    private fun startCountdownService(remainingMs: Long) {
+        appContext?.let { TimerForegroundService.start(it, remainingMs) }
+    }
+
+    private fun stopCountdownService() {
+        appContext?.let { TimerForegroundService.stop(it) }
+    }
 
     init {
         AppLogger.i(TAG, "TimerViewModel created")
-        // v2.5.6 Story 4: Restore state from TimerStateStore when there was an active timer
+        // v2.5.6 Story 4: Restore state from TimerStateStore if there was an active timer
         restoreFromStore()
     }
 
@@ -98,21 +115,21 @@ class TimerViewModel(
      * v2.5.6: Restore timer state from TimerStateStore (after app kill or reboot).
      *
      * - If there was a running timer: compute remaining based on endTimeWallClock
-     * - If the timer already expired (remaining <= 0): mark as finished
+     * - If the timer already finished (remaining <= 0): mark as finished
      * - If the timer was paused: restore with isPaused=true
      */
     private fun restoreFromStore() {
         val store = stateStore ?: return
         val savedState = store.load() ?: return
 
-        val now = System.currentTimeMillis()
+        val now = io.github.calendaralarm.data.AppClock.now()
 
         if (savedState.isRunning) {
             // Timer was running — compute remaining time
             val remaining = savedState.endTimeWallClock - now
 
             if (remaining <= 0) {
-                // Timer already expired while the app was dead
+                // Timer already finished while the app was dead
                 // AlarmManager should have fired, but just in case:
                 AppLogger.i(TAG, "Restored timer already finished (remaining=$remaining)")
                 _uiState.update {
@@ -128,12 +145,16 @@ class TimerViewModel(
                         isRestored = true
                     )
                 }
-                // Clear the state — timer is done
-                store.clear()
-                // Trigger finished callback so the UI can start the alarm
-                onTimerFinished?.invoke()
+                // v2.7.0: Slightly expired (AlarmManager late/missed) → fire anyway.
+                // Long expired → close silently (don't ring an hour late).
+                if (-remaining <= LATE_FIRE_WINDOW_MS) {
+                    fireFinished("restore")
+                } else {
+                    store.claimFinished()
+                    AppLogger.w(TAG, "Timer ${-remaining}ms late on restore — no longer ringing")
+                }
             } else {
-                // Timer is still running — restore with the correct remaining time
+                // Timer still running — restore with the correct remaining time
                 AppLogger.i(TAG, "Restored running timer: ${formatDuration(remaining)} remaining")
                 endTimeWallClock = savedState.endTimeWallClock
                 endTimeElapsed = SystemClock.elapsedRealtime() + remaining
@@ -151,11 +172,12 @@ class TimerViewModel(
                         isRestored = true
                     )
                 }
-                // Restart the update loop
+                // Restart the update loop + countdown notification
                 startUpdateLoop()
+                startCountdownService(remaining)
             }
         } else {
-            // Timer was paused — restore with saved remaining time
+            // Timer was paused — restore with the saved remaining time
             AppLogger.i(TAG, "Restored paused timer: ${formatDuration(savedState.remainingMsAtSave)} remaining")
             _uiState.update {
                 it.copy(
@@ -183,10 +205,11 @@ class TimerViewModel(
         stopUpdateLoop()
         endTimeElapsed = 0L
         endTimeWallClock = 0L
-        // v2.5.6: cancel AlarmManager + clear state when timer is running
+        // v2.5.6: cancel AlarmManager + clear state if the timer is running
         if (wasRunning) {
             scheduler?.cancel()
             stateStore?.clear()
+            stopCountdownService()
         }
         _uiState.update {
             it.copy(
@@ -235,7 +258,7 @@ class TimerViewModel(
         }
 
         // v2.5.6: Compute wall clock end time (for persistence + AlarmManager)
-        endTimeWallClock = System.currentTimeMillis() + state.remainingMs
+        endTimeWallClock = io.github.calendaralarm.data.AppClock.now() + state.remainingMs
         endTimeElapsed = SystemClock.elapsedRealtime() + state.remainingMs
 
         _uiState.update {
@@ -244,6 +267,7 @@ class TimerViewModel(
 
         // v2.5.6 Story 4: Save state + schedule AlarmManager
         persistAndSchedule(state.remainingMs)
+        startCountdownService(state.remainingMs)
 
         startUpdateLoop()
         AppLogger.i(TAG, "Timer started: ${formatDuration(state.remainingMs)} remaining (endTimeWallClock=$endTimeWallClock)")
@@ -271,6 +295,7 @@ class TimerViewModel(
         // v2.5.6 Story 4: Update state (paused) + cancel AlarmManager
         persistPausedState(remaining.coerceAtLeast(0L))
         scheduler?.cancel()
+        stopCountdownService()
 
         AppLogger.i(TAG, "Timer paused at ${formatDuration(remaining)}")
     }
@@ -284,6 +309,7 @@ class TimerViewModel(
         // v2.5.6 Story 4: Clear state + cancel AlarmManager
         stateStore?.clear()
         scheduler?.cancel()
+        stopCountdownService()
 
         _uiState.update {
             it.copy(
@@ -307,6 +333,7 @@ class TimerViewModel(
         // v2.5.6 Story 4: Clear state + cancel AlarmManager
         stateStore?.clear()
         scheduler?.cancel()
+        stopCountdownService()
 
         _uiState.update {
             it.copy(
@@ -327,16 +354,16 @@ class TimerViewModel(
     }
 
     /**
-     * v2.5.6: Force a state refresh (e.g. after the app returns).
+     * v2.5.6: Force a state refresh (e.g. after returning to the app).
      * Recomputes remaining time based on wall clock.
      */
     fun refreshState() {
         val state = _uiState.value
         if (!state.isRunning) return
 
-        val remaining = endTimeWallClock - System.currentTimeMillis()
+        val remaining = endTimeWallClock - io.github.calendaralarm.data.AppClock.now()
         if (remaining <= 0) {
-            // Timer has expired
+            // Timer is finished
             _uiState.update {
                 it.copy(
                     remainingMs = 0L,
@@ -345,10 +372,8 @@ class TimerViewModel(
                     progress = 0f
                 )
             }
-            stateStore?.clear()
-            scheduler?.cancel()
             AppLogger.i(TAG, "Timer completed (refresh): ${formatDuration(state.totalMs)}")
-            onTimerFinished?.invoke()
+            fireFinished("refresh")
         } else {
             val progress = if (state.totalMs > 0) {
                 remaining.toFloat() / state.totalMs.toFloat()
@@ -414,7 +439,7 @@ class TimerViewModel(
                 if (!state.isRunning) break
 
                 // v2.5.6: Use wall clock time (consistent with TimerStateStore)
-                val remaining = endTimeWallClock - System.currentTimeMillis()
+                val remaining = endTimeWallClock - io.github.calendaralarm.data.AppClock.now()
                 if (remaining <= 0) {
                     // Timer finished
                     _uiState.update {
@@ -425,11 +450,9 @@ class TimerViewModel(
                             progress = 0f
                         )
                     }
-                    // v2.5.6: Clear state + cancel AlarmManager (timer is done)
-                    stateStore?.clear()
-                    scheduler?.cancel()
+                    // v2.7.0: idempotent firing (no-op if the AlarmManager receiver already fired)
                     AppLogger.i(TAG, "Timer completed: ${formatDuration(state.totalMs)}")
-                    onTimerFinished?.invoke()
+                    fireFinished("viewmodel")
                     break
                 } else {
                     val progress = if (state.totalMs > 0) {
@@ -455,13 +478,16 @@ class TimerViewModel(
     override fun onCleared() {
         super.onCleared()
         stopUpdateLoop()
-        // v2.5.6: Do NOT clear state here — the timer must survive ViewModel destroy
+        // v2.5.6: do NOT clear state here — the timer must survive ViewModel destroy
         // (ViewModel is destroyed on config changes, but the timer must keep running)
         AppLogger.i(TAG, "TimerViewModel cleared (state preserved in TimerStateStore)")
     }
 
     companion object {
         /** Format milliseconds as a human-readable duration. */
+        /** v2.7.0: max. delay at which a missed timer still fires on app start. */
+        private const val LATE_FIRE_WINDOW_MS = 5 * 60 * 1000L
+
         fun formatDuration(ms: Long): String {
             val totalSeconds = (ms / 1000).toInt()
             val hours = totalSeconds / 3600

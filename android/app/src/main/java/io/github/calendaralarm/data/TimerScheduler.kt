@@ -12,10 +12,10 @@ private const val TAG = "TimerScheduler"
 /**
  * v2.5.6 Story 2: AlarmManager integration for the countdown timer.
  *
- * Just like AlarmRepository for alarms, this class uses AlarmManager to
- * make the timer fire at an exact moment — even when the app is killed.
+ * Like AlarmRepository for alarms, this class uses AlarmManager to
+ * let the timer fire at an exact moment — even when the app is killed.
  *
- * Important choices:
+ * Key choices:
  * - setExactAndAllowWhileIdle(RTC_WAKEUP) — works in Doze mode, requires SCHEDULE_EXACT_ALARM
  * - RTC_WAKEUP (not ELAPSED_REALTIME_WAKEUP) — wall clock time survives reboot
  * - requestCode 9999 (unique, not conflicting with alarm IDs)
@@ -23,10 +23,10 @@ private const val TAG = "TimerScheduler"
  * - PendingIntent to TimerFireReceiver (BroadcastReceiver)
  *
  * Samsung S24 / Android 15 compatibility:
- * - setExactAndAllowWhileIdle works on Samsung with SCHEDULE_EXACT_ALARM permission
+ * - setExactAndAllowWhileIdle works on Samsung with the SCHEDULE_EXACT_ALARM permission
  * - RTC_WAKEUP is more reliable than ELAPSED_REALTIME for reboot recovery
  */
-class TimerScheduler(private val context: Context) {
+class TimerScheduler(context: Context) {
 
     private val appContext: Context = context.applicationContext
 
@@ -47,7 +47,7 @@ class TimerScheduler(private val context: Context) {
 
     /**
      * Check whether we may schedule exact alarms (Android 12+ / Samsung S24).
-     * Requires SCHEDULE_EXACT_ALARM permission (already declared in manifest).
+     * Requires the SCHEDULE_EXACT_ALARM permission (already declared in the manifest).
      */
     fun canScheduleExactAlarms(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -61,8 +61,8 @@ class TimerScheduler(private val context: Context) {
      * Schedule the timer to fire at [endTimeWallClockMs].
      *
      * @param endTimeWallClockMs Wall clock timestamp (System.currentTimeMillis based)
-     *                           when the timer should fire
-     * @return true when the alarm was successfully scheduled
+     *                           when the timer must fire
+     * @return true if the alarm was successfully scheduled
      */
     fun schedule(endTimeWallClockMs: Long): Boolean {
         if (!canScheduleExactAlarms()) {
@@ -70,8 +70,8 @@ class TimerScheduler(private val context: Context) {
             return false
         }
 
-        // Reject past times — timer already expired
-        val now = System.currentTimeMillis()
+        // Reject past times — timer already finished
+        val now = io.github.calendaralarm.data.AppClock.now()
         if (endTimeWallClockMs <= now) {
             AppLogger.w(TAG, "Timer end time is in the past (${endTimeWallClockMs} <= $now), not scheduling")
             return false
@@ -107,7 +107,7 @@ class TimerScheduler(private val context: Context) {
     }
 
     /**
-     * Cancel the timer alarm (on pause, stop, reset, or new timer start).
+     * Cancel the timer alarm (on pause, stop, reset, or a new timer start).
      */
     fun cancel() {
         val intent = Intent(appContext, TimerFireReceiver::class.java).apply {

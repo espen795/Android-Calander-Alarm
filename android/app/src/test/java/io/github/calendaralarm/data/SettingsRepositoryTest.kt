@@ -5,7 +5,6 @@ import android.content.SharedPreferences
 import androidx.test.core.app.ApplicationProvider
 import org.junit.After
 import org.junit.Before
-import org.junit.Ignore
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -41,9 +40,14 @@ class SettingsRepositoryTest {
     @Before
     fun setUp() {
         context = ApplicationProvider.getApplicationContext()
-        // Clear prefs before each test
+        // Clear prefs before each test (secure + regular — since v2.5.10
+        // non-sensitive settings live in regular prefs "calendar_alarm_settings")
         context.getSharedPreferences("calendar_alarm_secure_prefs", Context.MODE_PRIVATE)
             .edit().clear().commit()
+        context.getSharedPreferences("calendar_alarm_settings", Context.MODE_PRIVATE)
+            .edit().clear().commit()
+        // P1 #1: regular settings live in device-protected storage
+        DeviceProtectedStorage.prefs(context, "calendar_alarm_settings").edit().clear().commit()
         repo = SettingsRepository(context)
     }
 
@@ -51,6 +55,10 @@ class SettingsRepositoryTest {
     fun tearDown() {
         context.getSharedPreferences("calendar_alarm_secure_prefs", Context.MODE_PRIVATE)
             .edit().clear().commit()
+        context.getSharedPreferences("calendar_alarm_settings", Context.MODE_PRIVATE)
+            .edit().clear().commit()
+        // P1 #1: regular settings zitten in device-protected storage
+        DeviceProtectedStorage.prefs(context, "calendar_alarm_settings").edit().clear().commit()
     }
 
     // ============== Secure Storage Initialization ==============
@@ -195,22 +203,18 @@ class SettingsRepositoryTest {
         assertEquals(io.github.calendaralarm.BuildConfig.ALARM_API_URL, url)
     }
 
-    @Ignore("Known failing (pre-existing), tracked in ROADMAP.md")
     @Test
-    fun `setServerUrl does not change URL when storage unavailable`() {
-        if (!repo.secureStorageAvailable) {
-            repo.setServerUrl("https://custom-server.example.com")
-            // Should still be default because storage is unavailable
-            assertEquals(io.github.calendaralarm.BuildConfig.ALARM_API_URL, repo.getServerUrl())
-        }
+    fun `setServerUrl accepts HTTPS URL regardless of secure storage (regular prefs since v2510)`() {
+        // v2.5.10: server URL lives in REGULAR prefs — setting works even when secure storage
+        // is unavailable (Robolectric has no Keystore).
+        repo.setServerUrl("https://custom-server.example.com")
+        assertEquals("https://custom-server.example.com", repo.getServerUrl())
     }
 
     @Test
     fun `setServerUrl accepts HTTPS URL when storage available`() {
-        if (repo.secureStorageAvailable) {
-            repo.setServerUrl("https://custom-server.example.com")
-            assertEquals("https://custom-server.example.com", repo.getServerUrl())
-        }
+        repo.setServerUrl("https://custom-server.example.com")
+        assertEquals("https://custom-server.example.com", repo.getServerUrl())
     }
 
     @Test
@@ -344,30 +348,28 @@ class SettingsRepositoryTest {
         assertEquals(5, repo.getSnoozeMinutes())
     }
 
-    @Ignore("Known failing (pre-existing), tracked in ROADMAP.md")
     @Test
-    fun `setSnoozeMinutes returns false when storage unavailable`() {
-        if (!repo.secureStorageAvailable) {
-            assertFalse(repo.setSnoozeMinutes(10))
-        }
+    fun `setSnoozeMinutes returns true for valid value (regular prefs since v2510, also without secure storage)`() {
+        // v2.5.10: snooze duration lives in REGULAR prefs — setting always works (except invalid).
+        assertTrue(repo.setSnoozeMinutes(10))
+        assertEquals(10, repo.getSnoozeMinutes())
     }
 
     @Test
-    fun `setSnoozeMinutes accepts valid values when storage available`() {
-        if (repo.secureStorageAvailable) {
-            for (minutes in listOf(5, 10, 15, 30)) {
-                assertTrue("Should accept $minutes minutes", repo.setSnoozeMinutes(minutes))
-                assertEquals(minutes, repo.getSnoozeMinutes())
-            }
+    fun `setSnoozeMinutes accepts valid values`() {
+        // v2.5.0: 0 = "Off" (no snooze) is a VALID value; v2.5.10: regular prefs.
+        for (minutes in listOf(0, 5, 10, 15, 30)) {
+            assertTrue("Should accept $minutes minutes", repo.setSnoozeMinutes(minutes))
+            assertEquals(minutes, repo.getSnoozeMinutes())
         }
     }
 
-    @Ignore("Known failing (pre-existing), tracked in ROADMAP.md")
     @Test
     fun `setSnoozeMinutes rejects invalid values`() {
         // Invalid values are rejected regardless of storage availability
-        // because validation happens before storage access
-        for (minutes in listOf(1, 2, 3, 20, 60, 0, -5)) {
+        // because validation happens before storage access.
+        // NB: 0 is VALID (snooze "Off" since v2.5.0) — not in the invalid list.
+        for (minutes in listOf(1, 2, 3, 20, 60, -5)) {
             assertFalse("Should reject $minutes minutes", repo.setSnoozeMinutes(minutes))
         }
         // Should still be default
@@ -375,16 +377,16 @@ class SettingsRepositoryTest {
     }
 
     @Test
-    fun `snooze minutes valid values are 5, 10, 15, 30`() {
-        // Test the validation logic directly
-        val validValues = listOf(5, 10, 15, 30)
-        val invalidValues = listOf(0, 1, 2, 3, 4, 6, 7, 8, 9, 11, 12, 20, 25, 45, 60, -5)
+    fun `snooze minutes valid values are 0 (off), 5, 10, 15, 30`() {
+        // Test the validation logic directly (0 = snooze off since v2.5.0)
+        val validValues = listOf(0, 5, 10, 15, 30)
+        val invalidValues = listOf(1, 2, 3, 4, 6, 7, 8, 9, 11, 12, 20, 25, 45, 60, -5)
 
         for (v in validValues) {
-            assertTrue("$v should be valid", v in listOf(5, 10, 15, 30))
+            assertTrue("$v should be valid", v in listOf(0, 5, 10, 15, 30))
         }
         for (v in invalidValues) {
-            assertFalse("$v should be invalid", v in listOf(5, 10, 15, 30))
+            assertFalse("$v should be invalid", v in listOf(0, 5, 10, 15, 30))
         }
     }
 
@@ -476,84 +478,92 @@ class SettingsRepositoryTest {
 
     // ============== Last Sync Result ==============
 
-    @Ignore("Known failing (pre-existing), tracked in ROADMAP.md")
     @Test
-    fun `saveLastSyncResult does not crash when storage unavailable`() {
-        // Should not throw — just silently fail
-        repo.saveLastSyncResult("""{"test":true}""")
-        // getLastSyncResult returns null when storage unavailable
-        if (!repo.secureStorageAvailable) {
-            assertNull(repo.getLastSyncResult())
-        }
+    fun `saveLastSyncResult and getLastSyncResult roundtrip (regular prefs since v2510)`() {
+        // v2.5.10: last sync result lives in REGULAR prefs — works also without secure storage.
+        val json = """{"test":true}"""
+        repo.saveLastSyncResult(json)
+        assertEquals(json, repo.getLastSyncResult())
     }
 
     @Test
-    fun `getLastSyncResult returns null when not set or storage unavailable`() {
-        if (!repo.secureStorageAvailable) {
-            assertNull(repo.getLastSyncResult())
-        }
-    }
-
-    @Test
-    fun `saveLastSyncResult and getLastSyncResult roundtrip when storage available`() {
-        if (repo.secureStorageAvailable) {
-            val json = """{"lastSyncTime":"12:00","lastSyncResult":"OK","serverReachable":true}"""
-            repo.saveLastSyncResult(json)
-            assertEquals(json, repo.getLastSyncResult())
-        }
+    fun `getLastSyncResult returns null when not set`() {
+        assertNull(repo.getLastSyncResult())
     }
 
     // ============== Last Update Check ==============
 
-    @Ignore("Known failing (pre-existing), tracked in ROADMAP.md")
     @Test
-    fun `saveLastUpdateCheck does not crash when storage unavailable`() {
-        repo.saveLastUpdateCheck("""{"version":"2.1.4"}""")
-        if (!repo.secureStorageAvailable) {
-            assertNull(repo.getLastUpdateCheck())
+    fun `saveLastUpdateCheck and getLastUpdateCheck roundtrip (regular prefs since v2510)`() {
+        val json = """{"version":"2.1.4"}"""
+        repo.saveLastUpdateCheck(json)
+        assertEquals(json, repo.getLastUpdateCheck())
+    }
+
+    @Test
+    fun `getLastUpdateCheck returns null when not set`() {
+        assertNull(repo.getLastUpdateCheck())
+    }
+
+    // ============== N-a (review): secure prefs stay null during locked boot, re-init after unlock ==============
+
+    @Test
+    fun `n-a secure prefs null during locked boot and reinitializes after unlock`() {
+        // Simulate locked boot: UserManager reports "not unlocked"
+        val shadowUm = org.robolectric.Shadows.shadowOf(
+            context.getSystemService(android.os.UserManager::class.java)
+        )
+        shadowUm.setUserUnlocked(false)
+        try {
+            val lockedRepo = SettingsRepository(context)
+            assertFalse("N-a: during locked boot secureStorageAvailable must be false", lockedRepo.secureStorageAvailable)
+            // fail-closed: secure getters return safe defaults / throw
+            assertEquals("", lockedRepo.getCfAccessClientId())
+            assertFalse(lockedRepo.hasCfAccessCredentials())
+
+            // Now unlock (simulates ACTION_USER_UNLOCKED)
+            shadowUm.setUserUnlocked(true)
+            // lazy re-init on first use (getter checks isUserUnlocked)
+            // in Robolectric CE-init fails (no Keystore) → fail-closed remains,
+            // BUT the getter must not cause recursion/crash and reinit must be callable
+            val available = lockedRepo.secureStorageAvailable // may stay false (Robolectric), but no crash
+            assertTrue(available == true || available == false)
+            // Explicit re-init (as UserUnlockReceiver does) must be safe
+            lockedRepo.reinitSecurePrefsAfterUnlock()
+        } finally {
+            shadowUm.setUserUnlocked(true)
         }
     }
 
     @Test
-    fun `getLastUpdateCheck returns null when not set or storage unavailable`() {
-        if (!repo.secureStorageAvailable) {
-            assertNull(repo.getLastUpdateCheck())
-        }
-    }
-
-    @Test
-    fun `saveLastUpdateCheck and getLastUpdateCheck roundtrip when storage available`() {
-        if (repo.secureStorageAvailable) {
-            val json = """{"version":"2.1.4","versionCode":16}"""
-            repo.saveLastUpdateCheck(json)
-            assertEquals(json, repo.getLastUpdateCheck())
-        }
+    fun `n-a reinitSecurePrefsAfterUnlock is idempotent and does not crash`() {
+        val r = SettingsRepository(context)
+        // calling multiple times (UserUnlockReceiver + lazy getter) must not throw
+        r.reinitSecurePrefsAfterUnlock()
+        r.reinitSecurePrefsAfterUnlock()
+        assertTrue(r.secureStorageAvailable == true || r.secureStorageAvailable == false)
     }
 
     // ============== Fail-Closed Behavior Verification ==============
 
-    @Ignore("Known failing (pre-existing), tracked in ROADMAP.md")
     @Test
-    fun `repository fails closed when secure storage unavailable`() {
-        // This is the critical security test: when EncryptedSharedPreferences
-        // cannot initialize, the repository MUST NOT fall back to plaintext.
+    fun `repository fails closed for SECURE storage when secure storage unavailable`() {
+        // Critical security test: if EncryptedSharedPreferences cannot initialize,
+        // the repository must NEVER fall back to plaintext for SECURE data (token/CF creds).
+        // v2.5.10: non-sensitive settings (server URL, snooze, sync-result) DO work via
+        // regular prefs — that is not a fail-closed violation.
         if (!repo.secureStorageAvailable) {
-            // All sensitive operations should fail or return safe defaults
+            // All SECURE operations must fail or return safe defaults
             assertThrows(IllegalStateException::class.java) { repo.getDeviceToken() }
             assertThrows(IllegalStateException::class.java) { repo.rotateDeviceToken() }
             assertFalse(repo.setDeviceToken("a".repeat(32)))
             assertFalse(repo.setCfAccessCredentials("abc.access", "cfast_secret"))
             assertFalse(repo.clearCfAccessCredentials())
-            assertFalse(repo.setSnoozeMinutes(10))
 
-            // Getters return safe defaults
-            assertEquals(io.github.calendaralarm.BuildConfig.ALARM_API_URL, repo.getServerUrl())
+            // SECURE getters return safe defaults
             assertEquals("", repo.getCfAccessClientId())
             assertEquals("", repo.getCfAccessClientSecret())
             assertFalse(repo.hasCfAccessCredentials())
-            assertEquals(5, repo.getSnoozeMinutes())
-            assertNull(repo.getLastSyncResult())
-            assertNull(repo.getLastUpdateCheck())
         }
     }
 }

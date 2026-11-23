@@ -26,6 +26,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import io.github.calendaralarm.BuildConfig
 import io.github.calendaralarm.data.AppLogger
+import io.github.calendaralarm.sync.UpdateFallbackPolicy
 import java.io.File
 import java.io.FileOutputStream
 import java.net.URI
@@ -48,15 +49,21 @@ class UpdateChecker(private val context: Context) {
     companion object {
         private const val TAG = "UpdateChecker"
         private const val MAX_APK_SIZE = 50L * 1024 * 1024 // 50 MB
+        private const val PREFS_PIN_FALLBACK = "update_pin_fallback"
+        private const val KEY_PIN_FALLBACK = "pin_fallback_active"
 
         /**
-         * Optional pinned SHA-256 fingerprint of the release signing certificate,
-         * set at build time via the CALALARM_UPDATE_SIGNER_SHA256 Gradle property
-         * (`keytool -list -v -keystore release.jks` → SHA256, without colons).
-         * Empty = skip the pin; the downloaded APK must still match the signer of
-         * the installed app, which Android enforces for updates anyway.
+         * SHA-256 fingerprint (hex) of the release signing certificate, set at build
+         * time via the CALALARM_UPDATE_SIGNER_SHA256 Gradle property
+         * (`keytool -list -v -keystore release.jks` → SHA256, colons allowed).
+         * The in-app updater is DISABLED unless both this and UPDATE_SERVER_URL are set
+         * (fail-closed: no update is ever installed without a pinned signer).
          */
         val PINNED_SIGNER_SHA256: String = BuildConfig.UPDATE_SIGNER_SHA256.replace(":", "").lowercase()
+
+        /** True when the in-app updater has everything it needs to verify updates. */
+        val UPDATES_CONFIGURED: Boolean =
+            BuildConfig.UPDATE_SERVER_URL.isNotBlank() && Regex("^[0-9a-f]{64}$").matches(PINNED_SIGNER_SHA256)
 
         private val SHA256_REGEX = Regex("^[0-9a-fA-F]{64}$")
         private val APK_PATH_REGEX = Regex("^/releases/calendar-alarm-v[0-9A-Za-z._-]{1,64}\\.apk$")
@@ -64,19 +71,113 @@ class UpdateChecker(private val context: Context) {
 
     private val json = Json { ignoreUnknownKeys = true }
 
-    private val httpClient = HttpClient(CIO) {
-        install(ContentNegotiation) {
-            json(json)
-        }
-        // H-02: never follow redirects for update downloads
-        followRedirects = false
-        engine {
-            requestTimeout = 60_000 // APK downloads can take a while
-            // Certificate pinning (same as SyncRepository — Ktor CIO doesn't use Android NSC)
-            https {
-                trustManager = io.github.calendaralarm.sync.CertificatePinner.trustManager
+    /**
+     * Opus review B1: fixed update host from BuildConfig.UPDATE_SERVER_URL. If that
+     * has no valid host → IllegalStateException (fail-closed, no client).
+     */
+    private val updateHost: String by lazy {
+        io.github.calendaralarm.sync.CertificatePins.extractHost(BuildConfig.UPDATE_SERVER_URL)
+            ?: throw IllegalStateException(
+                "Invalid UPDATE_SERVER_URL (no host): ${BuildConfig.UPDATE_SERVER_URL} — update channel deactivated (fail-closed)"
+            )
+    }
+
+    /**
+     * Phase 3 point 3 (review #7c): the update channel has a RECOVERY PATH.
+     * Primary: pinned client (pinning + hostname verification, FIXED host — B1).
+     * On PinMismatchException ONLY version.json and the APK download fall back
+     * to system-trust WITHOUT pinning (but with hostname verification). Safe because
+     * the APK is always verified on sha256 + exact size + signer certificate
+     * (pinned) + versionCode. Sync and log upload have NO fallback — fail-closed.
+     */
+    private val pinnedClient: HttpClient by lazy {
+        HttpClient(CIO) {
+            install(ContentNegotiation) {
+                json(json)
+            }
+            // H-02: never follow redirects for update downloads
+            followRedirects = false
+            engine {
+                requestTimeout = 60_000 // APK downloads can take a while
+                https {
+                    trustManager = io.github.calendaralarm.sync.CertificatePinner.pinnedTrustManager(updateHost)
+                }
             }
         }
+    }
+
+    /** Fallback client: system trust store, no pinning — ONLY for the update channel. */
+    private val fallbackClient: HttpClient by lazy {
+        HttpClient(CIO) {
+            install(ContentNegotiation) {
+                json(json)
+            }
+            followRedirects = false
+            engine {
+                requestTimeout = 60_000
+                https {
+                    trustManager = io.github.calendaralarm.sync.CertificatePinner.systemTrustManager(updateHost)
+                }
+            }
+        }
+    }
+
+    /**
+     * True when pinning just failed and the update channel is running on the
+     * system-trust fallback. Shown in Settings → Diagnostics.
+     */
+    @Volatile
+    var pinFallbackActive: Boolean = false
+        private set
+
+    /**
+     * Perform a GET on the update channel. Try pinned first; on a PIN
+     * mismatch (PinMismatchException) fall back to system trust (recovery path
+     * #7c) via the production policy [UpdateFallbackPolicy.shouldFallback].
+     * Hostname errors and all other errors propagate (no fallback).
+     * On a successful PINNED response the fallback flag is cleared.
+     */
+    private suspend fun getWithPinFallback(url: String, block: io.ktor.client.request.HttpRequestBuilder.() -> Unit): HttpResponse {
+        return try {
+            val response = pinnedClient.get(url, block)
+            // successful pinned request → clear pin-fallback flag (non-blocking Opus)
+            // Always check the PERSISTENT flag too (also after restart / new instance) —
+            // otherwise the warning in Settings would stay forever.
+            pinFallbackActive = false
+            runCatching {
+                val prefs = context.getSharedPreferences(PREFS_PIN_FALLBACK, Context.MODE_PRIVATE)
+                if (prefs.contains(KEY_PIN_FALLBACK)) prefs.edit().remove(KEY_PIN_FALLBACK).apply()
+            }
+            response
+        } catch (e: Exception) {
+            if (UpdateFallbackPolicy.shouldFallback(UpdateFallbackPolicy.Channel.UPDATE, e)) {
+                activatePinFallback(url, e, block)
+            } else {
+                throw e
+            }
+        }
+    }
+
+    /**
+     * Policy (phase 3 point 3, #7c): fallback ONLY for the update channel and ONLY
+     * on a real pin mismatch. See UpdateFallbackPolicyTest for the decision matrix
+     * (sync/log-upload = fail-closed; hostname error = no fallback).
+     */
+    private suspend fun activatePinFallback(
+        url: String,
+        cause: Exception,
+        block: io.ktor.client.request.HttpRequestBuilder.() -> Unit
+    ): HttpResponse {
+        pinFallbackActive = true
+        AppLogger.e(TAG, "pin-fail → fallback system trust for update channel (${cause.javaClass.simpleName}: ${cause.message?.take(120)})")
+        AppLogger.w(TAG, "WARNING: certificate pinning failed — update needed! (visible in Settings → Diagnostics)")
+        // Mark in prefs so the Diagnostics UI shows it after a restart too
+        runCatching {
+            context.getSharedPreferences(PREFS_PIN_FALLBACK, Context.MODE_PRIVATE)
+                .edit().putBoolean(KEY_PIN_FALLBACK, true).apply()
+        }
+        // Retry without pinning — ONLY for this update channel, with the same headers
+        return fallbackClient.get(url, block)
     }
 
     private val userAgent = "CalendarAlarm/${io.github.calendaralarm.BuildConfig.VERSION_NAME} (Android ${Build.VERSION.RELEASE}; ${Build.MODEL})"
@@ -109,6 +210,20 @@ class UpdateChecker(private val context: Context) {
         val error: String? = null
     )
 
+    /** True if pinning ever failed (also after restart, via prefs). */
+    fun isPinFallbackActive(): Boolean {
+        if (pinFallbackActive) return true
+        return context.getSharedPreferences(PREFS_PIN_FALLBACK, Context.MODE_PRIVATE)
+            .getBoolean(KEY_PIN_FALLBACK, false)
+    }
+
+    /** Clear the pin-fallback flag (e.g. after successful pinned sync or manual reset). */
+    fun clearPinFallback() {
+        pinFallbackActive = false
+        context.getSharedPreferences(PREFS_PIN_FALLBACK, Context.MODE_PRIVATE)
+            .edit().remove(KEY_PIN_FALLBACK).apply()
+    }
+
     suspend fun checkForUpdate(): CheckResult = withContext(Dispatchers.IO) {
         AppLogger.d(TAG, "checkForUpdate() called")
         
@@ -119,18 +234,18 @@ class UpdateChecker(private val context: Context) {
         }
         
         try {
-            if (BuildConfig.UPDATE_SERVER_URL.isBlank()) {
+            if (!UPDATES_CONFIGURED) {
                 return@withContext CheckResult(
                     updateAvailable = false,
                     currentVersion = BuildConfig.VERSION_NAME,
                     currentVersionCode = BuildConfig.VERSION_CODE,
-                    error = "Update server not configured"
+                    error = "In-app updates not configured"
                 )
             }
             val url = "${BuildConfig.UPDATE_SERVER_URL}/version.json"
             AppLogger.d(TAG, "GET $url")
 
-            val response: HttpResponse = httpClient.get(url) {
+            val response: HttpResponse = getWithPinFallback(url) {
                 addHeaders(this)
             }
             AppLogger.d(TAG, "Update check response: HTTP ${response.status.value}")
@@ -138,8 +253,8 @@ class UpdateChecker(private val context: Context) {
             if (!response.status.isSuccess()) {
                 // v2.5.9 Story 1: Detailed, actionable error messages based on HTTP status
                 val errorMsg = when (response.status.value) {
-                    301, 302, 307, 308 -> "Server redirect (302) — Cloudflare Access login required"
-                    401 -> "Not authorized (401) — check Cloudflare Access credentials"
+                    301, 302, 307, 308 -> "Server redirect (302) — Cloudflare Access login vereist"
+                    401 -> "Unauthorized (401) — check Cloudflare Access credentials"
                     403 -> "Forbidden (403) — Cloudflare blocks, check Client ID + Secret"
                     404 -> "Not found (404) — server URL possibly wrong"
                     in 500..599 -> "Server error (${response.status.value}) — try again later"
@@ -192,7 +307,7 @@ class UpdateChecker(private val context: Context) {
 
             val downloadUrl = try {
                 val uri = URI(BuildConfig.UPDATE_SERVER_URL).resolve(versionInfo.url)
-                if (uri.scheme != "https" || uri.host != URI(BuildConfig.UPDATE_SERVER_URL).host || uri.rawUserInfo != null) {
+                if (uri.scheme != "https" || uri.host != updateHost || uri.rawUserInfo != null) {
                     return@withContext CheckResult(
                         updateAvailable = false,
                         currentVersion = BuildConfig.VERSION_NAME,
@@ -260,7 +375,7 @@ class UpdateChecker(private val context: Context) {
 
         try {
             AppLogger.d(TAG, "Downloading APK...")
-            val response: HttpResponse = httpClient.get(downloadUrl) {
+            val response: HttpResponse = getWithPinFallback(downloadUrl) {
                 addHeaders(this)
             }
 
@@ -286,7 +401,7 @@ class UpdateChecker(private val context: Context) {
                     output.write(buffer, 0, read)
                     totalBytes += read
 
-                    // Early abort when file gets too large (max 50MB)
+                    // Early abort when the file gets too large (max 50MB)
                     if (totalBytes > MAX_APK_SIZE) {
                         AppLogger.e(TAG, "Download exceeds max size: $totalBytes > $MAX_APK_SIZE")
                         aborted = true
@@ -338,9 +453,67 @@ class UpdateChecker(private val context: Context) {
     }
 
     /**
-     * C-03: Verify the downloaded APK's signing certificate against the pinned
-     * release certificate AND the currently installed app's signer.
-     * Also checks package name and version code.
+     * Phase 3 point 4 (review #35) + Opus B3: read ALL signers + history from the APK
+     * (via signingInfo — NEVER pm.hasSigningCertificate(apkPath, …), which expects
+     * a package NAME, not a path, and always fails with a path).
+     *
+     * @return triple (contentsSigners, history, hasMultipleSigners) or null on error.
+     */
+    private fun readArchiveSigning(pm: PackageManager, apkPath: String): Triple<List<ByteArray>, List<ByteArray>, Boolean>? {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val info = getPackageArchiveInfo(pm, apkPath, PackageManager.GET_SIGNING_CERTIFICATES) ?: return null
+                val si = info.signingInfo ?: return null
+                Triple(
+                    si.apkContentsSigners.map { it.toByteArray() },
+                    si.signingCertificateHistory?.map { it.toByteArray() } ?: emptyList(),
+                    si.hasMultipleSigners()
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                val info = pm.getPackageArchiveInfo(apkPath, PackageManager.GET_SIGNATURES) ?: return null
+                @Suppress("DEPRECATION")
+                val sigs = info.signatures?.map { it.toByteArray() } ?: return null
+                Triple(sigs, emptyList(), sigs.size > 1)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error reading archive signing info")
+            null
+        }
+    }
+
+    /** Read ALL signers of the installed app (contents + history). */
+    private fun readInstalledSigning(pm: PackageManager, packageName: String): Pair<List<ByteArray>, List<ByteArray>>? {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val flags = PackageManager.GET_SIGNING_CERTIFICATES
+                val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    pm.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(flags.toLong()))
+                } else {
+                    @Suppress("DEPRECATION")
+                    pm.getPackageInfo(packageName, flags.toInt())
+                }
+                val si = info.signingInfo ?: return null
+                si.apkContentsSigners.map { it.toByteArray() } to
+                    (si.signingCertificateHistory?.map { it.toByteArray() } ?: emptyList())
+            } else {
+                @Suppress("DEPRECATION")
+                val info = pm.getPackageInfo(packageName, PackageManager.GET_SIGNATURES)
+                @Suppress("DEPRECATION")
+                (info.signatures?.map { it.toByteArray() } ?: emptyList()) to emptyList<ByteArray>()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error reading installed signing info")
+            null
+        }
+    }
+
+    /**
+     * C-03 + #35 + Opus B3: verify the APK signature purely via signingInfo
+     * (apkContentsSigners + signingCertificateHistory) against the pinned signer,
+     * and cross-check SETS (no firstOrNull): the installed signer(s) must be
+     * present in the archive history/contents. All logic lives in
+     * [io.github.calendaralarm.sync.SignerCheck] (pure, tested).
      */
     fun verifyApkSignature(apkFile: File): Boolean {
         return try {
@@ -367,29 +540,32 @@ class UpdateChecker(private val context: Context) {
                 return false
             }
 
-            // Get archive signing certificate
-            val archiveSigner = getArchiveSigner(pm, apkFile.absolutePath)
-            if (archiveSigner == null) {
-                Log.e(TAG, "Could not extract archive signer")
+            // B3: read ALL signers + history from the archive (signingInfo, no hasSigningCertificate(apkPath))
+            val archiveSigning = readArchiveSigning(pm, apkFile.absolutePath)
+            if (archiveSigning == null) {
+                Log.e(TAG, "Could not read archive signing info")
+                return false
+            }
+            val (contentsSigners, history, hasMultiple) = archiveSigning
+            val allowed = setOf(PINNED_SIGNER_SHA256)
+
+            // #35/B3: all contents-signers must be in pinned set or in (pinned) history — fail-closed
+            if (!io.github.calendaralarm.sync.SignerCheck.archiveSignersAllowed(contentsSigners, history, allowed)) {
+                Log.e(TAG, "APK signer(s) do not match pinned release certificate (incl. history)! multiple=$hasMultiple")
                 return false
             }
 
-            // Compare against pinned certificate (C-03)
-            val archiveSignerSha256 = MessageDigest.getInstance("SHA-256").digest(archiveSigner)
-            val pinnedBytes = PINNED_SIGNER_SHA256.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
-            if (PINNED_SIGNER_SHA256.isNotEmpty() && !MessageDigest.isEqual(archiveSignerSha256, pinnedBytes)) {
-                Log.e(TAG, "APK signer does not match pinned release certificate!")
+            // B3 cross-check: installed signer(s) must be present in archive history/contents (SET comparison)
+            val installedSigning = readInstalledSigning(pm, context.packageName)
+            if (installedSigning == null) {
+                Log.e(TAG, "Could not read installed signing info")
                 return false
             }
-
-            // Compare against currently installed app's signer
-            val installedSigner = getInstalledSigner(pm)
-            if (installedSigner == null) {
-                Log.e(TAG, "Could not extract installed signer")
-                return false
-            }
-            if (!MessageDigest.isEqual(archiveSigner, installedSigner)) {
-                Log.e(TAG, "APK signer does not match installed app signer!")
+            if (!io.github.calendaralarm.sync.SignerCheck.installedSignerCoveredByArchive(
+                    installedSigning.first, contentsSigners, history
+                )
+            ) {
+                Log.e(TAG, "Installed signer not covered by archive signing history/contents!")
                 return false
             }
 
@@ -422,6 +598,8 @@ class UpdateChecker(private val context: Context) {
 
     @Suppress("DEPRECATION")
     private fun getArchiveSigner(pm: PackageManager, apkPath: String): ByteArray? {
+        // NB: only used for logging/diagnostics — the real check uses
+        // readArchiveSigning() (all signers + history), see verifyApkSignature (B3).
         return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 val flags = PackageManager.GET_SIGNING_CERTIFICATES
@@ -493,6 +671,7 @@ class UpdateChecker(private val context: Context) {
     }
 
     fun close() {
-        httpClient.close()
+        pinnedClient.close()
+        fallbackClient.close()
     }
 }

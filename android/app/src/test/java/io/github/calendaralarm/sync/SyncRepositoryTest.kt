@@ -100,6 +100,26 @@ class SyncRepositoryTest {
     }
 
     @Test
+    fun `AlarmPlan deserializes optioneel source veld (P2A 13)`() {
+        val jsonParser = Json {
+            ignoreUnknownKeys = true
+            namingStrategy = kotlinx.serialization.json.JsonNamingStrategy.SnakeCase
+        }
+        val withSource = jsonParser.decodeFromString<SyncRepository.AlarmPlan>("""
+            {"date":"2026-11-23","wake_time":"07:00","label":"Kantoor","work_location":"office",
+             "confidence":"high","event_count":3,"source":"cache"}
+        """.trimIndent())
+        assertEquals("cache", withSource.source)
+
+        // Backwards compatible: zonder source → null
+        val withoutSource = jsonParser.decodeFromString<SyncRepository.AlarmPlan>("""
+            {"date":"2026-11-23","wake_time":"07:00","label":"Kantoor","work_location":"office",
+             "confidence":"high","event_count":3}
+        """.trimIndent())
+        assertEquals(null, withoutSource.source)
+    }
+
+    @Test
     fun `AlarmPlan handles unknown keys gracefully`() {
         val json = """
             {
@@ -399,11 +419,11 @@ class SyncRepositoryTest {
         // This tests the error message mapping logic from fetchAlarmPlan
         val statusCode = 401
         val errorMsg = when (statusCode) {
-            401 -> "Server weigerde de device token (401). Check of de token in de app overeenkomt met de server."
-            403 -> "Cloudflare blokkeerde het verzoek (403). Check Client ID + Secret in Instellingen → Cloudflare Access."
-            404 -> "Endpoint niet gevonden (404). Check de Server URL."
-            429 -> "Te veel verzoeken (429). Wacht een minuut."
-            503 -> "Server is niet beschikbaar (503). Check of de server draait."
+            401 -> "Server rejected the device token (401). Check that the token in the app matches the server."
+            403 -> "Cloudflare blocked the request (403). Check Client ID + Secret in Settings → Cloudflare Access."
+            404 -> "Endpoint not found (404). Check the Server URL."
+            429 -> "Too many requests (429). Wait a minute."
+            503 -> "Server is not available (503). Check whether the server is running."
             else -> "Server error $statusCode"
         }
         assertTrue(errorMsg.contains("401"))
@@ -414,11 +434,11 @@ class SyncRepositoryTest {
     fun `HTTP 403 maps to Cloudflare error message`() {
         val statusCode = 403
         val errorMsg = when (statusCode) {
-            401 -> "Server weigerde de device token (401)"
-            403 -> "Cloudflare blokkeerde het verzoek (403). Check Client ID + Secret in Instellingen → Cloudflare Access."
-            404 -> "Endpoint niet gevonden (404)"
-            429 -> "Te veel verzoeken (429)"
-            503 -> "Server is niet beschikbaar (503)"
+            401 -> "Server rejected the device token (401)"
+            403 -> "Cloudflare blocked the request (403). Check Client ID + Secret in Settings → Cloudflare Access."
+            404 -> "Endpoint not found (404)"
+            429 -> "Too many requests (429)"
+            503 -> "Server is not available (503)"
             else -> "Server error $statusCode"
         }
         assertTrue(errorMsg.contains("403"))
@@ -431,7 +451,7 @@ class SyncRepositoryTest {
         val errorMsg = when (statusCode) {
             401 -> "token error"
             403 -> "cloudflare error"
-            404 -> "Endpoint niet gevonden (404). Check de Server URL."
+            404 -> "Endpoint not found (404). Check the Server URL."
             429 -> "rate limit"
             503 -> "unavailable"
             else -> "Server error $statusCode"
@@ -448,11 +468,11 @@ class SyncRepositoryTest {
             403 -> "cloudflare error"
             404 -> "not found"
             429 -> "rate limit"
-            503 -> "Server is niet beschikbaar (503). Check of de server draait."
+            503 -> "Server is not available (503). Check whether the server is running."
             else -> "Server error $statusCode"
         }
         assertTrue(errorMsg.contains("503"))
-        assertTrue(errorMsg.contains("niet beschikbaar"))
+        assertTrue(errorMsg.contains("not available"))
     }
 
     @Test
@@ -475,12 +495,12 @@ class SyncRepositoryTest {
     fun `Config save HTTP 400 maps to validation error`() {
         val statusCode = 400
         val errorMsg = when (statusCode) {
-            400 -> "Ongeldige config (check tijden HH:mm, unieke ids, max 20 regels)"
-            401 -> "Server weigerde de device token (401)"
-            413 -> "Config te groot (max 100 KB)"
+            400 -> "Invalid config (check times HH:mm, unique ids, max 20 rules)"
+            401 -> "Server rejected the device token (401)"
+            413 -> "Config too large (max 100 KB)"
             else -> "Server error $statusCode"
         }
-        assertTrue(errorMsg.contains("Ongeldige config"))
+        assertTrue(errorMsg.contains("Invalid config"))
     }
 
     @Test
@@ -489,10 +509,10 @@ class SyncRepositoryTest {
         val errorMsg = when (statusCode) {
             400 -> "Ongeldige config"
             401 -> "token error"
-            413 -> "Config te groot (max 100 KB)"
+            413 -> "Config too large (max 100 KB)"
             else -> "Server error $statusCode"
         }
-        assertTrue(errorMsg.contains("te groot"))
+        assertTrue(errorMsg.contains("too large"))
     }
 
     // ============== JSON Edge Cases ==============

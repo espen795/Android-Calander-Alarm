@@ -29,12 +29,12 @@ import androidx.lifecycle.LiveData
 import androidx.lifecycle.Observer
 import androidx.compose.runtime.livedata.observeAsState
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import io.github.calendaralarm.BuildConfig
 import io.github.calendaralarm.CalendarAlarmApp
 import io.github.calendaralarm.data.*
 import io.github.calendaralarm.data.SyncStatusCache
-import io.github.calendaralarm.data.TimerAlarmHelper
 import io.github.calendaralarm.ui.theme.CalGreen
 import io.github.calendaralarm.ui.theme.CalGrey
 import io.github.calendaralarm.ui.theme.CalOrange
@@ -59,7 +59,7 @@ fun MainScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("⏰ Calendar Alarm") },
+                title = { Text("🌌 Calendar Alarm") },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.surface
                 )
@@ -103,6 +103,7 @@ fun StatusScreen(
     // Real state — no hard-coded values (H-11 fix)
     var alarms by remember { mutableStateOf<List<AlarmStore.OwnedAlarm>>(emptyList()) }
     var hasExactAlarmPermission by remember { mutableStateOf(repo.canScheduleExactAlarms()) }
+    var criticalPermissionsOk by remember { mutableStateOf(PermissionStatus.read(context).criticalOk) }
     var secureStorageOk by remember { mutableStateOf(settingsRepo.secureStorageAvailable) }
 
     // Refresh state periodically (F4 fix)
@@ -110,6 +111,7 @@ fun StatusScreen(
         while(true) {
             alarms = repo.store.getEnabled()
             hasExactAlarmPermission = repo.canScheduleExactAlarms()
+            criticalPermissionsOk = PermissionStatus.read(context).criticalOk
             secureStorageOk = settingsRepo.secureStorageAvailable
             delay(60_000) // Refresh every minute
         }
@@ -124,7 +126,8 @@ fun StatusScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         // Permission warning card — only show if something is missing
-        if (!hasExactAlarmPermission || !secureStorageOk) {
+        // v2.7.0: full permission check lives in Settings; here only a warning
+        if (!hasExactAlarmPermission || !criticalPermissionsOk || !secureStorageOk) {
             item {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
@@ -138,8 +141,11 @@ fun StatusScreen(
                                 Text("Grant permission")
                             }
                         }
+                        if (!criticalPermissionsOk) {
+                            Text("Not all alarm/timer permissions granted — see Settings → Permissions", style = MaterialTheme.typography.bodyMedium)
+                        }
                         if (!secureStorageOk) {
-                            Text("Secure storage unavailable", style = MaterialTheme.typography.bodyMedium, color = CalRed)
+                            Text("Secure storage not available", style = MaterialTheme.typography.bodyMedium, color = CalRed)
                         }
                     }
                 }
@@ -152,215 +158,6 @@ fun StatusScreen(
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text("App version", style = MaterialTheme.typography.bodyMedium, color = CalGrey)
                     Text("v${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})", style = MaterialTheme.typography.titleLarge)
-                }
-            }
-        }
-
-        // v2.6.8: TEST BUTTONS — manually test alarm and vibration
-        item {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = CalOrange.copy(alpha = 0.15f))
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text("🧪 Test Features", style = MaterialTheme.typography.titleMedium, color = CalOrange)
-                    Text(
-                        "Test alarm (sound + screen) and test silent alarm (screen + vibrate, NO sound)",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = CalGrey
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    
-                    // Test Alarm button (sound + full-screen)
-                    Button(
-                        onClick = {
-                            AppLogger.i(TAG_UI, "v2.6.8: User clicked TEST ALARM button")
-                            android.widget.Toast.makeText(context, "🧪 Test alarm (sound) in 5 seconds...", android.widget.Toast.LENGTH_SHORT).show()
-                            scope.launch {
-                                val testTime = System.currentTimeMillis() + 5000
-                                val testAlarm = AlarmStore.OwnedAlarm(
-                                    id = 999999,
-                                    triggerAtMillis = testTime,
-                                    timeLabel = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date(testTime)),
-                                    label = "TEST ALARM (GELUID)",
-                                    date = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault()).format(java.util.Date(testTime)),
-                                    type = "test",
-                                    enabled = true
-                                )
-                                val result = repo.schedule(testAlarm, force = true)
-                                if (result != null) {
-                                    AppLogger.i(TAG_UI, "v2.6.8: Test alarm scheduled successfully")
-                                } else {
-                                    AppLogger.e(TAG_UI, "v2.6.8: Failed to schedule test alarm")
-                                    android.widget.Toast.makeText(context, "❌ Could not schedule test alarm", android.widget.Toast.LENGTH_LONG).show()
-                                }
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.buttonColors(containerColor = CalOrange)
-                    ) {
-                        Icon(Icons.Default.BugReport, contentDescription = null)
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text("Test Alarm (sound, 5 sec)")
-                    }
-                    
-                    Spacer(modifier = Modifier.height(8.dp))
-                    
-                    // v2.6.11: Test SILENT Alarm button (fullscreen + vibrate, NO sound)
-                    // Start the FULL alarm process (FSI notification → fullscreen activity) but without sound
-                    Button(
-                        onClick = {
-                            AppLogger.i(TAG_UI, "v2.6.11: User clicked TEST SILENT ALARM button")
-                            android.widget.Toast.makeText(context, "🔕 Test SILENT alarm started (5 sec, NO sound)...", android.widget.Toast.LENGTH_SHORT).show()
-                            
-                            // Start silent alarm via AlarmForegroundService (fullscreen + vibration, no sound)
-                            val testTime = System.currentTimeMillis()
-                            val timeLabel = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date(testTime))
-                            io.github.calendaralarm.service.AlarmForegroundService.startSilent(
-                                context,
-                                alarmId = 999998,  // Special ID for silent test
-                                timeLabel = timeLabel,
-                                alarmLabel = "TEST SILENT ALARM"
-                            )
-                            
-                            // Stop after 5 seconds (when the user did not dismiss themselves)
-                            scope.launch {
-                                kotlinx.coroutines.delay(5000)
-                                io.github.calendaralarm.service.AlarmForegroundService.stop(context)
-                                android.widget.Toast.makeText(context, "✅ Test silent alarm stopped", android.widget.Toast.LENGTH_SHORT).show()
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.buttonColors(containerColor = CalPurple)
-                    ) {
-                        Icon(Icons.Default.VolumeOff, contentDescription = null)
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text("Test Silent Alarm (5 sec, no sound)")
-                    }
-                }
-            }
-        }
-
-        // v2.6.9: Extended permission status card with all critical checks
-        item {
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text("🔐 Permission Status", style = MaterialTheme.typography.titleMedium)
-                    Spacer(modifier = Modifier.height(8.dp))
-                    
-                    val nm = context.getSystemService(android.content.Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
-                    val pm = context.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
-                    
-                    // Check 1: USE_FULL_SCREEN_INTENT (Critical for Android 14+)
-                    val canFullScreen = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                        nm.canUseFullScreenIntent()
-                    } else {
-                        true
-                    }
-                    
-                    // Check 2: SYSTEM_ALERT_WINDOW ("Appear on top") — Samsung requires this
-                    val canOverlay = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
-                        android.provider.Settings.canDrawOverlays(context)
-                    } else {
-                        true
-                    }
-                    
-                    // Check 3: Battery optimization exemption
-                    val batteryUnrestricted = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
-                        pm.isIgnoringBatteryOptimizations(context.packageName)
-                    } else {
-                        true
-                    }
-                    
-                    // Check 4: Exact alarm permission
-                    val hasExactAlarmPermission = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
-                        val alarmManager = context.getSystemService(android.content.Context.ALARM_SERVICE) as android.app.AlarmManager
-                        alarmManager.canScheduleExactAlarms()
-                    } else {
-                        true
-                    }
-                    
-                    Text(
-                        "Full screen permission: ${if (canFullScreen) "✅ GRANTED" else "❌ DENIED (Critical!)"}",
-                        color = if (canFullScreen) CalGreen else CalRed,
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-                    Text(
-                        "Appear over other apps: ${if (canOverlay) "✅ GRANTED" else "❌ DENIED (Samsung!)"}",
-                        color = if (canOverlay) CalGreen else CalRed,
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-                    Text(
-                        "Battery optimization: ${if (batteryUnrestricted) "✅ DISABLED" else "⚠️ ENABLED (Samsung kills app!)"}",
-                        color = if (batteryUnrestricted) CalGreen else CalOrange,
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-                    Text(
-                        "Exact alarms: ${if (hasExactAlarmPermission) "✅ GRANTED" else "❌ DENIED"}",
-                        color = if (hasExactAlarmPermission) CalGreen else CalRed,
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-                    
-                    Spacer(modifier = Modifier.height(8.dp))
-                    
-                    // v2.6.9: Buttons for missing permissions
-                    if (!canFullScreen && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                        Button(
-                            onClick = {
-                                // v2.6.9 FIX: Open SPECIFIC full screen intent settings (was general notification settings)
-                                val intent = android.content.Intent(android.provider.Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT).apply {
-                                    data = android.net.Uri.parse("package:${context.packageName}")
-                                }
-                                context.startActivity(intent)
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = ButtonDefaults.buttonColors(containerColor = CalRed)
-                        ) {
-                            Text("⚠️ Enable 'Full screen' (CRITICAL)")
-                        }
-                        Spacer(modifier = Modifier.height(4.dp))
-                    }
-                    
-                    if (!canOverlay && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
-                        Button(
-                            onClick = {
-                                val intent = android.content.Intent(
-                                    android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                    android.net.Uri.parse("package:${context.packageName}")
-                                )
-                                context.startActivity(intent)
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = ButtonDefaults.buttonColors(containerColor = CalOrange)
-                        ) {
-                            Text("Enable 'Appear over other apps'")
-                        }
-                        Spacer(modifier = Modifier.height(4.dp))
-                    }
-                    
-                    if (!batteryUnrestricted && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
-                        Button(
-                            onClick = {
-                                val intent = android.content.Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                                    data = android.net.Uri.parse("package:${context.packageName}")
-                                }
-                                context.startActivity(intent)
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = ButtonDefaults.buttonColors(containerColor = CalOrange)
-                        ) {
-                            Text("Disable battery optimization")
-                        }
-                        Spacer(modifier = Modifier.height(4.dp))
-                    }
-                    
-                    if (canFullScreen && canOverlay && batteryUnrestricted) {
-                        Text(
-                            "✅ All permissions OK for fullscreen alarm!",
-                            color = CalGreen,
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                    }
                 }
             }
         }
@@ -410,7 +207,7 @@ fun StatusScreen(
                         color = CalGrey
                     )
                     if (lastSyncTime != null) {
-                        Text("Laatste sync: $lastSyncTime", style = MaterialTheme.typography.bodySmall, color = CalGrey)
+                        Text("Last sync: $lastSyncTime", style = MaterialTheme.typography.bodySmall, color = CalGrey)
                     }
                     if (lastSyncResult != null) {
                         Text(
@@ -425,65 +222,82 @@ fun StatusScreen(
                     // Manual sync button
                     Button(
                         onClick = {
-                            AppLogger.i(TAG_UI, "User clicked 'Sync now with server'")
-                            // v2.5.8: User actions are ALWAYS allowed, even during Alarm Freeze
-                            // Freeze only blocks AUTOMATED sync (AlarmSyncWorker)
+                            AppLogger.i(TAG_UI, "User clicked 'Sync now'")
+                            // P2B #14: manual sync runs via AlarmSyncWorker (expedited
+                            // one-shot, unique name, REPLACE) — no duplicated worker logic
+                            // here (it lacked the today-guard, date check and fail counter).
+                            // input manual=true → the worker skips the freeze check (manual
+                            // syncing is always allowed, as the old UI code did).
                             isSyncing = true
+                            val builder = androidx.work.OneTimeWorkRequestBuilder<io.github.calendaralarm.worker.AlarmSyncWorker>()
+                            // P2B re-review B4: expedited requires its own
+                            // getForegroundInfo() on API < 31 — only request expedited on 31+.
+                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                                builder.setExpedited(androidx.work.OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+                            }
+                            val request = builder
+                                .setInputData(androidx.work.workDataOf(io.github.calendaralarm.worker.AlarmSyncWorker.INPUT_MANUAL to true))
+                                .setConstraints(
+                                    androidx.work.Constraints.Builder()
+                                        .setRequiredNetworkType(androidx.work.NetworkType.CONNECTED)
+                                        .build()
+                                )
+                                .build()
+                            val wm = androidx.work.WorkManager.getInstance(context)
+                            wm.enqueueUniqueWork(
+                                io.github.calendaralarm.worker.AlarmSyncWorker.MANUAL_WORK_NAME,
+                                androidx.work.ExistingWorkPolicy.REPLACE,
+                                request
+                            )
+                            // UI status via WorkInfo: RUNNING = busy, finished = done/error
                             scope.launch {
-                                val syncRepo = io.github.calendaralarm.sync.SyncRepository(context)
-                                // Health check first
-                                val healthy = syncRepo.healthCheck()
-                                serverReachable = healthy
-                                if (!healthy) {
-                                    lastSyncResult = "❌ Server unreachable"
-                                    AppLogger.e(TAG_UI, "Manual sync: health check FAILED")
-                                    isSyncing = false
-                                    syncRepo.close()
-                                    return@launch
-                                }
-                                // Fetch alarm plan
-                                val result = syncRepo.fetchAlarmPlan()
-                                syncRepo.close()
-                                val now = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())
-                                lastSyncTime = now
-                                if (result.success && result.plan != null) {
-                                    val plan = result.plan
-                                    AppLogger.i(TAG_UI, "Manual sync received plan: ${plan.wakeTime} on ${plan.date}")
-                                    // Schedule the alarm
-                                    val targetDate = try {
-                                        java.time.LocalDate.parse(plan.date)
-                                    } catch (e: Exception) {
-                                        java.time.LocalDate.now().plusDays(1)
+                                try {
+                                    // P2B re-review B2: follow THIS run (request.id), not the unique name —
+                                    // otherwise an old finished run or an empty list can immediately show
+                                    // the wrong outcome. Max 90 s (e.g. no network) → message.
+                                    val info = kotlinx.coroutines.withTimeoutOrNull(90_000) {
+                                        wm.getWorkInfoByIdFlow(request.id).first { it?.state?.isFinished == true }
                                     }
-                                    if (plan.wakeTime == null) {
-                                        // No alarm (e.g. weekend without weekend rule)
-                                        val cancelled = repo.cancelForDate(targetDate)
-                                        lastSyncResult = "😴 No alarm — ${plan.label}"
-                                        alarms = repo.store.getEnabled()
-                                        AppLogger.i(TAG_UI, "Manual sync: no alarm scheduled (${plan.label})")
-                                    } else {
-                                        val scheduled = repo.replaceForDate(targetDate, plan.wakeTime, plan.label, plan.workLocation)
-                                        if (scheduled != null) {
-                                            lastSyncResult = "✅ ${plan.wakeTime} — ${plan.label}"
+                                    if (info == null) wm.cancelWorkById(request.id)
+                                    val now = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
+                                        .format(java.util.Date(io.github.calendaralarm.data.AppClock.now()))
+                                    lastSyncTime = now
+                                    when (info?.state) {
+                                        androidx.work.WorkInfo.State.SUCCEEDED -> {
+                                            serverReachable = true
+                                            // Show latest wake plan from the worker prefs (written by the worker)
+                                            val prefs = io.github.calendaralarm.data.DeviceProtectedStorage.prefs(
+                                                context, io.github.calendaralarm.worker.SyncFailurePolicy.PREFS_NAME
+                                            )
+                                            val wake = prefs.getString("last_wake_time", null)
+                                            lastSyncResult = if (wake != null) "✅ $wake synced" else "✅ Synced"
                                             alarms = repo.store.getEnabled()
-                                            AppLogger.i(TAG_UI, "Manual sync: alarm scheduled (id=${scheduled.id})")
-                                        } else {
-                                            lastSyncResult = "❌ Could not schedule alarm"
-                                            AppLogger.e(TAG_UI, "Manual sync: failed to schedule alarm (permission?)")
+                                        }
+                                        androidx.work.WorkInfo.State.FAILED -> {
+                                            serverReachable = false
+                                            lastSyncResult = "❌ Sync failed"
+                                        }
+                                        null -> {
+                                            serverReachable = false
+                                            lastSyncResult = "❌ Server unreachable (timeout)"
+                                        }
+                                        else -> {
+                                            serverReachable = false
+                                            lastSyncResult = "❌ Sync cancelled"
                                         }
                                     }
-                                } else {
-                                    lastSyncResult = "❌ ${result.error ?: "Sync failed"}"
-                                    AppLogger.e(TAG_UI, "Manual sync FAILED: ${result.error}")
-                                }
-                                // Cache result
-                                settingsRepo.saveLastSyncResult(
-                                    kotlinx.serialization.json.Json.encodeToString(
-                                        SyncStatusCache.serializer(),
-                                        SyncStatusCache(lastSyncTime, lastSyncResult, serverReachable)
+                                    settingsRepo.saveLastSyncResult(
+                                        kotlinx.serialization.json.Json.encodeToString(
+                                            SyncStatusCache.serializer(),
+                                            SyncStatusCache(lastSyncTime, lastSyncResult, serverReachable)
+                                        )
                                     )
-                                )
-                                isSyncing = false
+                                } catch (e: Exception) {
+                                    AppLogger.e(TAG_UI, "P2B #14: WorkInfo observer error: ${e.message}")
+                                    lastSyncResult = "❌ Sync error"
+                                } finally {
+                                    isSyncing = false
+                                }
                             }
                         },
                         enabled = !isSyncing && secureStorageOk,
@@ -496,7 +310,7 @@ fun StatusScreen(
                         } else {
                             Icon(Icons.Default.Sync, contentDescription = null)
                             Spacer(modifier = Modifier.width(8.dp))
-                            Text("Sync now with server")
+                            Text("Sync now")
                         }
                     }
                 }
@@ -546,7 +360,7 @@ fun StatusScreen(
                                     color = CalGrey
                                 )
                             }
-                            // Right column: Fires in countdown
+                            // Right column: Fires-in countdown
                             Column(
                                 horizontalAlignment = Alignment.End,
                                 modifier = Modifier.padding(start = 16.dp)
@@ -591,7 +405,7 @@ fun StatusScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Wake times (via server)", style = MaterialTheme.typography.titleMedium)
+                        Text("Wake times (via the server)", style = MaterialTheme.typography.titleMedium)
                         if (rulesLoaded) {
                             Icon(Icons.Default.CloudDone, contentDescription = null, tint = CalGreen, modifier = Modifier.size(18.dp))
                         }
@@ -608,7 +422,7 @@ fun StatusScreen(
                             )
                         }
                     } else {
-                        Text("Not fetched yet — tap ‘Sync now with server’", style = MaterialTheme.typography.bodyMedium, color = CalGrey)
+                        Text("Not fetched yet — tap ‘Sync now’", style = MaterialTheme.typography.bodyMedium, color = CalGrey)
                     }
                 }
             }
@@ -628,99 +442,12 @@ fun StatusScreen(
                     }
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        "The app checks every evening with the server (via HTTPS) what tomorrow's wake time is, " +
+                        "The app checks with the server every evening (via HTTPS) what tomorrow's wake time is, " +
                         "based on your Outlook calendar. " +
                         "Alarms are managed locally and fire at the set time, even when the screen is off.",
                         style = MaterialTheme.typography.bodySmall,
                         color = CalGrey
                     )
-                }
-            }
-        }
-
-        // Quick actions
-        item {
-            var testAlarmMinutes by remember { mutableIntStateOf(2) }
-            var isSettingTestAlarm by remember { mutableStateOf(false) }
-            var lastActionResult by remember { mutableStateOf<String?>(null) }
-            var showResultSnackbar by remember { mutableStateOf(false) }
-
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text("Snelle acties", style = MaterialTheme.typography.titleMedium)
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    // Test alarm with configurable delay
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("Test alarm in:", style = MaterialTheme.typography.bodyMedium)
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            IconButton(
-                                onClick = { if (testAlarmMinutes > 1) testAlarmMinutes-- },
-                                enabled = !isSettingTestAlarm
-                            ) {
-                                Icon(Icons.Default.Remove, contentDescription = "Less")
-                            }
-                            Text("$testAlarmMinutes min", style = MaterialTheme.typography.titleMedium, modifier = Modifier.width(60.dp), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
-                            IconButton(
-                                onClick = { if (testAlarmMinutes < 30) testAlarmMinutes++ },
-                                enabled = !isSettingTestAlarm
-                            ) {
-                                Icon(Icons.Default.Add, contentDescription = "More")
-                            }
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    Button(
-                        onClick = {
-                            AppLogger.i(TAG_UI, "User clicked 'Test alarm' ($testAlarmMinutes min)")
-                            // v2.5.8: User actions are ALWAYS allowed, even during Alarm Freeze
-                            // Freeze only blocks AUTOMATED sync (AlarmSyncWorker)
-                            isSettingTestAlarm = true
-                            scope.launch {
-                                val delayMs = testAlarmMinutes * 60_000L
-                                val triggerTime = System.currentTimeMillis() + delayMs
-                                val fmt = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(triggerTime))
-                                val result = repo.scheduleOneShot(fmt, "🧪 Test alarm", type = "test")
-                                isSettingTestAlarm = false
-                                if (result != null) {
-                                    alarms = repo.store.getEnabled()
-                                    lastActionResult = "✅ Test alarm set for $fmt (in $testAlarmMinutes min)"
-                                    AppLogger.i(TAG_UI, "Test alarm scheduled: $fmt (id=${result.id})")
-                                    Toast.makeText(context, lastActionResult, Toast.LENGTH_LONG).show()
-                                } else {
-                                    lastActionResult = "❌ Could not set test alarm — check exact-alarm permission"
-                                    AppLogger.e(TAG_UI, "Test alarm FAILED — exact alarm permission?")
-                                    Toast.makeText(context, lastActionResult, Toast.LENGTH_LONG).show()
-                                }
-                            }
-                        },
-                        enabled = hasExactAlarmPermission && !isSettingTestAlarm,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        if (isSettingTestAlarm) {
-                            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-                        } else {
-                            Icon(Icons.Default.AlarmAdd, contentDescription = null)
-                        }
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(if (isSettingTestAlarm) "Busy…" else "Test alarm in $testAlarmMinutes min")
-                    }
-
-                    // Show last result
-                    if (lastActionResult != null) {
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            lastActionResult!!,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = if (lastActionResult!!.startsWith("✅")) CalGreen else CalRed
-                        )
-                    }
                 }
             }
         }
@@ -925,7 +652,7 @@ fun AlarmCard(
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
                             alarm.repeatDays.sorted().joinToString(",") {
-                                listOf("", "Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")[it]
+                                listOf("", "Ma", "Di", "Wo", "Do", "Vr", "Za", "Zo")[it]
                             },
                             style = MaterialTheme.typography.bodySmall,
                             color = CalPurple
@@ -1009,7 +736,13 @@ fun SettingsScreen() {
     ) {
         // Pull model: wake times are decided by the server (dynamic rules).
         // The local officeTime/homeTime/offTime settings are NOT used for alarms.
-        Text("Wake times (server)", style = MaterialTheme.typography.titleLarge)
+        // v2.7.0: Permission check (moved from the Status tab)
+        Text("Permissions", style = MaterialTheme.typography.titleLarge)
+        PermissionsCard()
+
+        Divider()
+
+        Text("Wake times (the server)", style = MaterialTheme.typography.titleLarge)
         Text(
             "These times are determined by the server based on your calendar. " +
             "You can adjust them here — the change is sent to the server.",
@@ -1064,7 +797,7 @@ fun SettingsScreen() {
                 }
                 if (snoozeMinutes == 0) {
                     Text(
-                        "⚠️ Snooze is disabled — there is no snooze button when the alarm rings",
+                        "⚠️ Snooze is disabled — when the alarm fires there is no snooze button",
                         style = MaterialTheme.typography.bodySmall,
                         color = CalOrange,
                         modifier = Modifier.padding(top = 4.dp)
@@ -1079,7 +812,7 @@ fun SettingsScreen() {
         Text("Alarm behavior", style = MaterialTheme.typography.titleLarge)
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(16.dp)) {
-                // Volume startniveau
+                // Volume start level
                 var volumeStart by remember { mutableFloatStateOf(0.3f) }
                 var volumeBuildUp by remember { mutableLongStateOf(30000L) }
                 var vibrationEnabled by remember { mutableStateOf(true) }
@@ -1088,7 +821,7 @@ fun SettingsScreen() {
                 var alarmSoundName by remember { mutableStateOf("Default alarm sound") }
 
                 LaunchedEffect(Unit) {
-                    val prefs = context.getSharedPreferences(CalendarAlarmApp.PREFS_ALARM_SETTINGS, Context.MODE_PRIVATE)
+                    val prefs = io.github.calendaralarm.data.DeviceProtectedStorage.prefs(context, CalendarAlarmApp.PREFS_ALARM_SETTINGS) // P1 #1: DP (same file the service reads)
                     volumeStart = prefs.getFloat(CalendarAlarmApp.PREF_VOLUME_START_LEVEL, 0.3f)
                     volumeBuildUp = prefs.getLong(CalendarAlarmApp.PREF_VOLUME_BUILD_UP_DURATION, 30000L)
                     vibrationEnabled = prefs.getBoolean(CalendarAlarmApp.PREF_VIBRATION_ENABLED, true)
@@ -1105,9 +838,9 @@ fun SettingsScreen() {
                     }
                 }
 
-                Text("Start volume", style = MaterialTheme.typography.titleMedium)
+                Text("Volume start level", style = MaterialTheme.typography.titleMedium)
                 Text(
-                    "Volume the alarm starts with (${(volumeStart * 100).toInt()}%)",
+                    "Volume the alarm starts at (${(volumeStart * 100).toInt()}%)",
                     style = MaterialTheme.typography.bodySmall,
                     color = CalGrey
                 )
@@ -1115,7 +848,7 @@ fun SettingsScreen() {
                     value = volumeStart,
                     onValueChange = { volumeStart = it },
                     onValueChangeFinished = {
-                        val prefs = context.getSharedPreferences(CalendarAlarmApp.PREFS_ALARM_SETTINGS, Context.MODE_PRIVATE)
+                        val prefs = io.github.calendaralarm.data.DeviceProtectedStorage.prefs(context, CalendarAlarmApp.PREFS_ALARM_SETTINGS) // P1 #1: DP (same file the service reads)
                         prefs.edit().putFloat(CalendarAlarmApp.PREF_VOLUME_START_LEVEL, volumeStart).apply()
                         Toast.makeText(context, "Start volume saved: ${(volumeStart * 100).toInt()}%", Toast.LENGTH_SHORT).show()
                     },
@@ -1137,7 +870,7 @@ fun SettingsScreen() {
                     value = volumeBuildUp.toFloat(),
                     onValueChange = { volumeBuildUp = it.toLong() },
                     onValueChangeFinished = {
-                        val prefs = context.getSharedPreferences(CalendarAlarmApp.PREFS_ALARM_SETTINGS, Context.MODE_PRIVATE)
+                        val prefs = io.github.calendaralarm.data.DeviceProtectedStorage.prefs(context, CalendarAlarmApp.PREFS_ALARM_SETTINGS) // P1 #1: DP (same file the service reads)
                         prefs.edit().putLong(CalendarAlarmApp.PREF_VOLUME_BUILD_UP_DURATION, volumeBuildUp).apply()
                         Toast.makeText(context, "Build-up time saved: ${volumeBuildUp / 1000}s", Toast.LENGTH_SHORT).show()
                     },
@@ -1166,7 +899,7 @@ fun SettingsScreen() {
                         checked = vibrationEnabled,
                         onCheckedChange = { newValue ->
                             vibrationEnabled = newValue
-                            val prefs = context.getSharedPreferences(CalendarAlarmApp.PREFS_ALARM_SETTINGS, Context.MODE_PRIVATE)
+                            val prefs = io.github.calendaralarm.data.DeviceProtectedStorage.prefs(context, CalendarAlarmApp.PREFS_ALARM_SETTINGS) // P1 #1: DP (same file the service reads)
                             prefs.edit().putBoolean(CalendarAlarmApp.PREF_VIBRATION_ENABLED, newValue).apply()
                             Toast.makeText(
                                 context,
@@ -1177,7 +910,39 @@ fun SettingsScreen() {
                     )
                 }
 
-                // Vibration pattern (only shown when vibration is on)
+                // v2.7.0: Hardware buttons (volume / power) during a ringing alarm
+                Spacer(modifier = Modifier.height(8.dp))
+                var hardwareAction by remember {
+                    mutableStateOf(
+                        io.github.calendaralarm.data.DeviceProtectedStorage.prefs(context, CalendarAlarmApp.PREFS_ALARM_SETTINGS) // P1 #1: DP (same file the service reads)
+                            .getString(CalendarAlarmApp.PREF_HARDWARE_BUTTON_ACTION, CalendarAlarmApp.HARDWARE_ACTION_DISMISS)
+                            ?: CalendarAlarmApp.HARDWARE_ACTION_DISMISS
+                    )
+                }
+                Text("Volume and power button", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "What one press of a hardware button does when the alarm is ringing",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = CalGrey
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf(
+                        CalendarAlarmApp.HARDWARE_ACTION_DISMISS to "Dismiss",
+                        CalendarAlarmApp.HARDWARE_ACTION_SNOOZE to "Snooze"
+                    ).forEach { (value, label) ->
+                        FilterChip(
+                            selected = hardwareAction == value,
+                            onClick = {
+                                hardwareAction = value
+                                io.github.calendaralarm.data.DeviceProtectedStorage.prefs(context, CalendarAlarmApp.PREFS_ALARM_SETTINGS) // P1 #1: DP (same file the service reads)
+                                    .edit().putString(CalendarAlarmApp.PREF_HARDWARE_BUTTON_ACTION, value).apply()
+                            },
+                            label = { Text(label) }
+                        )
+                    }
+                }
+
+                // Vibration pattern (only shown when vibrating is on)
                 if (vibrationEnabled) {
                     Spacer(modifier = Modifier.height(8.dp))
 
@@ -1198,7 +963,7 @@ fun SettingsScreen() {
                             selected = vibrationPattern == pattern,
                             onClick = {
                                 vibrationPattern = pattern
-                                val prefs = context.getSharedPreferences(CalendarAlarmApp.PREFS_ALARM_SETTINGS, Context.MODE_PRIVATE)
+                                val prefs = io.github.calendaralarm.data.DeviceProtectedStorage.prefs(context, CalendarAlarmApp.PREFS_ALARM_SETTINGS) // P1 #1: DP (same file the service reads)
                                 prefs.edit().putString(CalendarAlarmApp.PREF_VIBRATION_PATTERN, pattern).apply()
                                 Toast.makeText(context, "Pattern saved: $label", Toast.LENGTH_SHORT).show()
                             },
@@ -1210,7 +975,7 @@ fun SettingsScreen() {
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                // Geluid kiezer
+                // Sound picker
                 val ringtonePickerLauncher = rememberLauncherForActivityResult(
                     ActivityResultContracts.StartActivityForResult()
                 ) { result ->
@@ -1225,7 +990,7 @@ fun SettingsScreen() {
                             } catch (e: Exception) {
                                 alarmSoundName = "Selected sound"
                             }
-                            val prefs = context.getSharedPreferences(CalendarAlarmApp.PREFS_ALARM_SETTINGS, Context.MODE_PRIVATE)
+                            val prefs = io.github.calendaralarm.data.DeviceProtectedStorage.prefs(context, CalendarAlarmApp.PREFS_ALARM_SETTINGS) // P1 #1: DP (same file the service reads)
                             prefs.edit().putString(CalendarAlarmApp.PREF_ALARM_SOUND_URI, alarmSoundUri).apply()
                             Toast.makeText(context, "Sound saved: $alarmSoundName", Toast.LENGTH_SHORT).show()
                         }
@@ -1261,7 +1026,7 @@ fun SettingsScreen() {
                 // Reset button
                 OutlinedButton(
                     onClick = {
-                        val prefs = context.getSharedPreferences(CalendarAlarmApp.PREFS_ALARM_SETTINGS, Context.MODE_PRIVATE)
+                        val prefs = io.github.calendaralarm.data.DeviceProtectedStorage.prefs(context, CalendarAlarmApp.PREFS_ALARM_SETTINGS) // P1 #1: DP (same file the service reads)
                         prefs.edit().apply {
                             remove(CalendarAlarmApp.PREF_VOLUME_START_LEVEL)
                             remove(CalendarAlarmApp.PREF_VOLUME_BUILD_UP_DURATION)
@@ -1287,7 +1052,7 @@ fun SettingsScreen() {
 
         Divider()
 
-        // v2.5.8: Alarm Freeze — blocks ONLY automated sync during configured hours
+        // v2.5.8: Alarm Freeze — blocks ONLY automated sync during the configured hours
         // All user-initiated interactions (add, edit, delete, toggle, test, manual sync) work 24/7
         Text("Alarm Freeze", style = MaterialTheme.typography.titleLarge)
         Card(modifier = Modifier.fillMaxWidth()) {
@@ -1303,7 +1068,7 @@ fun SettingsScreen() {
                     Column(modifier = Modifier.weight(1f)) {
                         Text("Enable alarm freeze", style = MaterialTheme.typography.titleMedium)
                         Text(
-                            "During these times automatic sync is blocked. You can always change alarms manually.",
+                            "During these times automatic sync is blocked. You can always still change alarms yourself.",
                             style = MaterialTheme.typography.bodySmall,
                             color = CalGrey
                         )
@@ -1437,7 +1202,7 @@ fun SettingsScreen() {
             modifier = Modifier.fillMaxWidth(),
             singleLine = true,
             isError = !serverUrl.startsWith("https://"),
-            supportingText = { if (!serverUrl.startsWith("https://")) Text("Only HTTPS allowed") }
+            supportingText = { if (!serverUrl.startsWith("https://")) Text("HTTPS only allowed") }
         )
         Button(
             onClick = {
@@ -1495,9 +1260,9 @@ fun SettingsScreen() {
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
                     readOnly = !showToken,
-                    placeholder = { Text("Paste the token from the backend server here") },
+                    placeholder = { Text("Paste the token from the server here") },
                     supportingText = {
-                        Text("The server must know this exact token. Paste the token from the server .env file.")
+                        Text("The server must know exactly this token. Paste the token from the server .env file.")
                     }
                 )
 
@@ -1510,7 +1275,7 @@ fun SettingsScreen() {
                             val ok = settingsRepo.setDeviceToken(deviceToken)
                             Toast.makeText(
                                 context,
-                                if (ok) "Device token saved" else "Invalid token (min 32 chars)",
+                                if (ok) "Device token saved" else "Invalid token (min 32 characters)",
                                 Toast.LENGTH_SHORT
                             ).show()
                             if (ok) deviceTokenEdited = false
@@ -1518,7 +1283,7 @@ fun SettingsScreen() {
                         enabled = deviceTokenEdited && deviceToken.trim().length >= 32,
                         modifier = Modifier.weight(1f)
                     ) {
-                        Text("Save")
+                        Text("Opslaan")
                     }
                     OutlinedButton(
                         onClick = { showRotateDialog = true },
@@ -1601,7 +1366,7 @@ fun SettingsScreen() {
                         enabled = cfClientId.isNotBlank() && cfClientSecret.isNotBlank(),
                         modifier = Modifier.weight(1f)
                     ) {
-                        Text("Save")
+                        Text("Opslaan")
                     }
                     OutlinedButton(
                         onClick = {
@@ -1620,7 +1385,7 @@ fun SettingsScreen() {
                 }
 
                 Text(
-                    "Only needed when your backend and update server sit behind Cloudflare Access.",
+                    "Only needed if your backend and update server sit behind Cloudflare Access.",
                     style = MaterialTheme.typography.bodySmall,
                     color = CalGrey
                 )
@@ -1949,7 +1714,7 @@ fun SettingsScreen() {
                             androidx.work.WorkInfo.State.SUCCEEDED -> {
                                 Icon(Icons.Default.CheckCircle, contentDescription = null, tint = CalGreen)
                                 Spacer(modifier = Modifier.width(8.dp))
-                                Text("Download complete — see notification")
+                                Text("Download ready — see notification")
                             }
                             androidx.work.WorkInfo.State.FAILED -> {
                                 Icon(Icons.Default.Error, contentDescription = null, tint = CalRed)
@@ -2007,8 +1772,41 @@ fun SettingsScreen() {
 
         Divider()
 
-        // Debug: Logs (moved from separate tab into Settings)
-        Text("Debug", style = MaterialTheme.typography.titleLarge)
+        // Diagnostics: logs (the test/debug buttons were removed in v2.7.0)
+        Text("Diagnostics", style = MaterialTheme.typography.titleLarge)
+
+        // Phase 3 point 3 (#7c): warning when certificate pinning failed and
+        // the update channel is running on the system-trust fallback.
+        // Opus non-blocker: NO `UpdateChecker(context)` in remember — that leaks
+        // 2 CIO clients per recomposition. Static prefs read (no clients).
+        val pinFallback = remember {
+            context.getSharedPreferences("update_pin_fallback", android.content.Context.MODE_PRIVATE)
+                .getBoolean("pin_fallback_active", false)
+        }
+        if (pinFallback) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        "⚠️ Certificate pinning failed — update needed",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onErrorContainer
+                    )
+                    Text(
+                        "The server uses a certificate chain that is not in the pin list. " +
+                            "The update channel is temporarily using the default system trust store " +
+                            "(the APK is still verified by checksum + signature). " +
+                            "Install the latest version so the pin list gets updated.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onErrorContainer
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+        }
+
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(16.dp)) {
                 Text("View app logs", style = MaterialTheme.typography.titleMedium)
@@ -2038,7 +1836,7 @@ fun SettingsScreen() {
         Text("About", style = MaterialTheme.typography.titleLarge)
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(16.dp)) {
-                Text("⏰ Calendar Alarm v${BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.titleMedium)
+                Text("🌌 Calendar Alarm v${BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.titleMedium)
                 Text(
                     "Smart alarm driven by your calendar.\nSyncs with your self-hosted backend.",
                     style = MaterialTheme.typography.bodyMedium,
@@ -2048,7 +1846,7 @@ fun SettingsScreen() {
         }
     }
 
-    // Logs dialog (volledig scherm overlay)
+    // Logs dialog (full-screen overlay)
     if (showLogsDialog) {
         AlertDialog(
             onDismissRequest = { showLogsDialog = false },
@@ -2072,7 +1870,7 @@ fun SettingsScreen() {
         AlertDialog(
             onDismissRequest = { showRotateDialog = false },
             title = { Text("Rotate token?") },
-            text = { Text("The current device token becomes invalid. The server must be reconfigured with the new token.") },
+            text = { Text("The current device token will become invalid. The server must be reconfigured with the new token.") },
             confirmButton = {
                 TextButton(onClick = {
                     scope.launch {
@@ -2100,7 +1898,7 @@ fun SettingsScreen() {
  * Examples: "7h 23m", "23m", "45s", "now!"
  */
 private fun formatTimeUntil(triggerAtMillis: Long): String {
-    val diff = triggerAtMillis - System.currentTimeMillis()
+    val diff = triggerAtMillis - io.github.calendaralarm.data.AppClock.now()
     if (diff <= 0) return "now!"
     val totalSeconds = diff / 1000
     val hours = totalSeconds / 3600

@@ -8,13 +8,13 @@ private const val TAG = "TimerStateStore"
 /**
  * v2.5.6 Story 1: Persistent storage for timer state.
  *
- * Saves the timer state in SharedPreferences so the timer survives:
+ * Stores the timer state in SharedPreferences so the timer survives:
  * - App kill (swipe away, OOM killer)
  * - Device reboot
  * - Process death
  *
  * Uses SharedPreferences (not DataStore) because:
- * - Simple key-value pairs, no async complexity
+ * - Simple key-value pair, no async complexity
  * - commit() is synchronous — crash-safe (just like AlarmStore)
  * - Directly available in BroadcastReceivers (BootReceiver, TimerFireReceiver)
  *
@@ -27,7 +27,7 @@ class TimerStateStore(context: Context) {
      * Immutable snapshot of the timer state.
      *
      * @param isRunning true when the timer is actively running
-     * @param endTimeWallClock Wall clock timestamp (System.currentTimeMillis) when the timer expires
+     * @param endTimeWallClock Wall clock timestamp (System.currentTimeMillis) when the timer ends
      * @param totalMs Total duration in milliseconds
      * @param remainingMsAtSave Remaining time at the moment of saving (for paused timers)
      * @param customHours Custom hours input (for UI restore)
@@ -36,16 +36,16 @@ class TimerStateStore(context: Context) {
      */
     data class TimerState(
         val isRunning: Boolean,
-        val endTimeWallClock: Long,      // System.currentTimeMillis() based
+        val endTimeWallClock: Long,      // io.github.calendaralarm.data.AppClock.now() based
         val totalMs: Long,
-        val remainingMsAtSave: Long,     // For paused: how much was left
+        val remainingMsAtSave: Long,     // When paused: how much was left
         val customHours: Int,
         val customMinutes: Int,
         val customSeconds: Int
     )
 
     private val prefs: SharedPreferences =
-        context.applicationContext.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE)
+        DeviceProtectedStorage.prefs(context, PREFS_FILE)  // P1 #1: DP storage (timer overleeft boot vóór unlock)
 
     // v2.5.6: Cross-instance thread safety (just like AlarmStore)
     private object StoreLock
@@ -85,7 +85,7 @@ class TimerStateStore(context: Context) {
     }
 
     /**
-     * Clear the timer state (on stop/reset/expired).
+     * Clear the timer state (on stop/reset/finished).
      */
     fun clear() = synchronized(StoreLock) {
         prefs.edit()
@@ -108,8 +108,36 @@ class TimerStateStore(context: Context) {
     }
 
     /**
+     * v2.7.0: Atomic "claim" of the firing of a running timer.
+     *
+     * Both the AlarmManager receiver and the ViewModel loop (and BootReceiver) can detect
+     * the end of the timer. Only the first to claim may start ringing;
+     * that way it fires exactly once (no more duplicate ringing activities stealing
+     * each other's sound via onDestroy).
+     *
+     * @return true when this call claimed the running timer (state is now cleared),
+     *         false when there was no running timer (anymore).
+     */
+    fun claimFinished(): Boolean = synchronized(StoreLock) {
+        if (!prefs.getBoolean(KEY_IS_RUNNING, false)) {
+            return@synchronized false
+        }
+        prefs.edit()
+            .remove(KEY_IS_RUNNING)
+            .remove(KEY_END_TIME_WALL_CLOCK)
+            .remove(KEY_TOTAL_MS)
+            .remove(KEY_REMAINING_MS_AT_SAVE)
+            .remove(KEY_CUSTOM_HOURS)
+            .remove(KEY_CUSTOM_MINUTES)
+            .remove(KEY_CUSTOM_SECONDS)
+            .commit()
+        AppLogger.i(TAG, "TimerState claimed as finished")
+        true
+    }
+
+    /**
      * Compute the remaining time based on endTimeWallClock.
-     * Returns null when there is no state, or when the timer has already expired (<= 0).
+     * Returns null when there is no state, or when the timer has already finished (<= 0).
      * For paused timers: return remainingMsAtSave.
      */
     fun getRemainingMs(): Long? = synchronized(StoreLock) {
@@ -119,7 +147,7 @@ class TimerStateStore(context: Context) {
             return@synchronized state.remainingMsAtSave
         }
         // Running: compute based on wall clock
-        val remaining = state.endTimeWallClock - System.currentTimeMillis()
+        val remaining = state.endTimeWallClock - io.github.calendaralarm.data.AppClock.now()
         return@synchronized remaining
     }
 

@@ -3,6 +3,7 @@ package io.github.calendaralarm.data
 import android.content.Context
 import android.content.SharedPreferences
 import kotlinx.serialization.Serializable
+// AppLogger is in the same package (io.github.calendaralarm.data) — no import needed
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
@@ -37,15 +38,17 @@ class AlarmStore(context: Context) {
         val preAlarmId: Int = -1,   // F4: PendingIntent request code for pre-alarm, -1 = none
         val skipCount: Int = 0,     // F5: number of times to skip this repeat alarm
         val snoozeMinutesOverride: Int? = null,  // v2.5.0: per-alarm snooze override (null = use global, 0 = no snooze)
-        // v2.6.13 H3: true when the USER disabled this alarm (via UI toggle).
+        // v2.6.13 H3: true if the USER disabled this alarm (via UI toggle).
         // Distinguishes user-disable vs auto-disable (e.g. handleAlarmFired sets enabled=false
-        // as ringing-state — that is automatic and userDisabled stays false).
-        // Only when userDisabled=true may the sync (replaceForDate) NOT re-enable the alarm.
+        // as ringing-state — that is auto and userDisabled stays false).
+        // Only with userDisabled=true may the sync (replaceForDate) NOT re-enable the alarm.
         val userDisabled: Boolean = false
     )
 
+    // P1 review#1: device-protected storage — readable before the first unlock
+    // after a reboot (Direct Boot), so an alarm can ring before unlock.
     private val prefs: SharedPreferences =
-        context.applicationContext.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE)
+        DeviceProtectedStorage.prefs(context, PREFS_FILE)
 
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -73,7 +76,7 @@ class AlarmStore(context: Context) {
     fun getEnabled(): List<OwnedAlarm> = synchronized(StoreLock) { getAll().filter { it.enabled } }
 
     fun getNext(): OwnedAlarm? = synchronized(StoreLock) {
-        getEnabled().filter { it.triggerAtMillis > System.currentTimeMillis() }
+        getEnabled().filter { it.triggerAtMillis > io.github.calendaralarm.data.AppClock.now() }
             .minByOrNull { it.triggerAtMillis }
     }
 
@@ -96,7 +99,7 @@ class AlarmStore(context: Context) {
     }
 
     /**
-     * F5: Increment skip count for a repeat alarm (called when user taps "Skip this time").
+     * F5: Increment skip count for a repeat alarm (called when the user taps "Skip this time").
      */
     fun incrementSkipCount(id: Int): OwnedAlarm? = synchronized(StoreLock) {
         val alarm = get(id) ?: return@synchronized null
@@ -151,7 +154,7 @@ class AlarmStore(context: Context) {
     /**
      * v2.6.13 H3: Mark an alarm as disabled by the USER (UI toggle in MainScreen).
      * userDisabled=true means: the sync may NOT re-enable this alarm
-     * (see AlarmRepository.replaceForDate). When the user re-enables it,
+     * (see AlarmRepository.replaceForDate). When re-enabled by the user,
      * the flag is cleared again.
      *
      * Auto-disable (e.g. handleAlarmFired sets enabled=false as ringing-state) does
@@ -164,23 +167,118 @@ class AlarmStore(context: Context) {
         updated
     }
 
+    private var corruptNotified = false
+    private var lastQuarantinedRaw: String? = null
+
+    /**
+     * P1 fix review#2 + B3 (review): decode-fout afvangen zonder data stil te verliezen.
+     *
+     * - The raw (corrupt) blob is quarantined ONCE ([KEY_ALARMS_QUARANTINE],
+     *   plus max. [MAX_QUARANTINE_COPIES] timestamp copies) — after that persist() may
+     *   simply overwrite the main key: the raw data is secured and a permanent
+     *   write block would break the alarm chain (AlarmManager set, store not).
+     * - An ERROR is logged and (once per process) a notification is triggered
+     *   via [onCorruption].
+     * - If a valid backup ([KEY_ALARMS_BACKUP]) exists, it is used as the source on
+     *   corruption of the main key (last-known-good copy).
+     */
     private fun loadAll(): Map<Int, OwnedAlarm> {
         val raw = prefs.getString(KEY_ALARMS, null) ?: return emptyMap()
         return try {
             json.decodeFromString<Map<Int, OwnedAlarm>>(raw)
         } catch (e: Exception) {
-            emptyMap()
+            AppLogger.e(TAG, "P1 review#2/B3: AlarmStore JSON corrupt — quarantine + backup check: ${e.message}")
+            quarantineCorrupt(raw)
+            loadBackup() ?: run {
+                notifyCorruptionOnce()
+                emptyMap()
+            }
         }
     }
 
-    private fun persist(alarms: Map<Int, OwnedAlarm>) {
+    private fun quarantineCorrupt(raw: String) {
+        // B3: only write quarantine if this raw blob is not yet secured
+        // (same content as last time → skip; otherwise keep max 3 timestamp copies)
+        if (lastQuarantinedRaw == raw &&
+            prefs.getString(KEY_ALARMS_QUARANTINE, null) == raw) return
+        lastQuarantinedRaw = raw
+        try {
+            val editor = prefs.edit().putString(KEY_ALARMS_QUARANTINE, raw)
+            val ts = io.github.calendaralarm.data.AppClock.now()
+            editor.putString("$KEY_ALARMS_CORRUPT_PREFIX$ts", raw)
+            // trim history to max 3 copies
+            val tsKeys = prefs.all.keys
+                .filter { it.startsWith(KEY_ALARMS_CORRUPT_PREFIX) }
+                .sorted()
+            if (tsKeys.size >= MAX_QUARANTINE_COPIES) {
+                tsKeys.take(tsKeys.size - MAX_QUARANTINE_COPIES + 1).forEach { editor.remove(it) }
+            }
+            editor.commit()
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "P1: quarantine write failed: ${e.message}")
+        }
+    }
+
+    private fun loadBackup(): Map<Int, OwnedAlarm>? {
+        val raw = prefs.getString(KEY_ALARMS_BACKUP, null) ?: return null
+        return try {
+            val decoded = json.decodeFromString<Map<Int, OwnedAlarm>>(raw)
+            AppLogger.w(TAG, "P1 review#2: main key corrupt — falling back to alarms_backup (${decoded.size} entries)")
+            decoded
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "P1 review#2: backup also corrupt: ${e.message}")
+            null
+        }
+    }
+
+    private fun notifyCorruptionOnce() {
+        if (corruptNotified) return
+        corruptNotified = true
+        try {
+            onCorruption?.invoke()
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "P1: onCorruption callback crashed: ${e.message}")
+        }
+    }
+
+    /**
+     * B3 (review): persist now returns a Boolean (true = written) and logs ERROR
+     * on failure, so the caller (e.g. schedule) can detect that the store did NOT
+     * get the entry while AlarmManager did.
+     */
+    private fun persist(alarms: Map<Int, OwnedAlarm>): Boolean {
         // HN-03: commit() instead of apply() — crash-safe
-        prefs.edit().putString(KEY_ALARMS, json.encodeToString(alarms)).commit()
+        val encoded = json.encodeToString(alarms)
+        // B3: no permanent write block anymore. The corrupt blob is already quarantined
+        // on the first loadAll (see quarantineCorrupt) — after that the main key may
+        // simply be overwritten, otherwise all saves would remain permanently refused.
+        val editor = prefs.edit()
+        editor.putString(KEY_ALARMS, encoded)
+        editor.putString(KEY_ALARMS_BACKUP, encoded)  // last-known-good copy
+        val ok = editor.commit()
+        if (!ok) {
+            AppLogger.e(TAG, "B3: persist() commit() failed — store NOT written (AlarmManager entry may now be out of sync)")
+        }
+        return ok
     }
 
     companion object {
+        private const val TAG = "AlarmStore"
         private const val PREFS_FILE = "calendar_alarm_store"
         private const val KEY_ALARMS = "alarms"
         private const val KEY_NEXT_ID = "next_id"
+        const val KEY_ALARMS_BACKUP = "alarms_backup"
+        const val KEY_ALARMS_QUARANTINE = "alarms_quarantine"
+        const val KEY_ALARMS_CORRUPT_PREFIX = "alarms_corrupt_"
+        /** B3: max number of timestamp quarantine copies (history) — prevents unbounded growth. */
+        const val MAX_QUARANTINE_COPIES = 3
+
+        /**
+         * P1 review#2: callback on detected corruption (once per process).
+         * Set from CalendarAlarmApp → shows "Alarm store corrupted — open the app".
+         * Null = no notification (e.g. in tests).
+         */
+        @Volatile
+        var onCorruption: (() -> Unit)? = null
     }
 }

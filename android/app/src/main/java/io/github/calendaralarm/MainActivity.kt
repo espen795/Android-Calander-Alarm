@@ -100,6 +100,15 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             android.util.Log.e("MainActivity", "Widget refresh onResume failed: ${e.message}")
         }
+        // P1 review#1 (Direct Boot): on the FIRST unlock after boot the
+        // WorkManager workers (sync/update/log) were not yet scheduled — do it now.
+        try {
+            if (io.github.calendaralarm.data.DeviceProtectedStorage.isUserUnlocked(this)) {
+                (application as? CalendarAlarmApp)?.scheduleWorkersOnceAfterUnlock()
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("MainActivity", "P1 #1 scheduleWorkers after unlock failed: ${e.message}")
+        }
     }
 
     /**
@@ -115,7 +124,7 @@ class MainActivity : ComponentActivity() {
                     AppLogger.w("MainActivity", "Battery optimization is ENABLED — alarm sync may be delayed")
                     Toast.makeText(
                         this,
-                        "⚠️ Battery optimization is ON — alarms may be delayed. Disable it in Settings.",
+                        "⚠️ Battery optimization is ON — alarms may be delayed. Turn it off in Settings.",
                         Toast.LENGTH_LONG
                     ).show()
                 } else {
@@ -134,7 +143,7 @@ class MainActivity : ComponentActivity() {
 
     /**
      * v2.5.7 PM fix MAJOR-04: Request battery optimization exemption.
-     * Opens system dialog to whitelist this app from battery optimization.
+     * Opens the system dialog to whitelist this app from battery optimization.
      * Critical for reliable alarm delivery on Samsung devices.
      */
     private fun requestBatteryOptimizationExemption() {

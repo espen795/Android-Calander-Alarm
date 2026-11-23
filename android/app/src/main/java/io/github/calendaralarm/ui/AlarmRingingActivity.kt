@@ -70,15 +70,16 @@ class AlarmRingingActivity : ComponentActivity() {
     private var snoozeAvailable: Boolean = true
     private var snoozeMinutes: Int = 5
 
-    // v2.5.13: Volume button press tracking (3 presses within 2s to dismiss)
-    private var volumePressCount = 0
-    private var lastVolumePressTime = 0L
+    // v2.7.0: one volume-button press = action (setting). Short guard after opening against
+    // accidental presses that still date from before the alarm fired.
+    private var createdAt = 0L
+    private var hardwareHandled = false
 
-    // v2.6.13 H2: true once the user has activated snooze/dismiss — onDestroy
-    // may then NOT stop the service (the receiver already does that).
+    // v2.6.13 H2: true once the user activated snooze/dismiss — onDestroy
+    // must then NOT stop the service (the receiver already does that).
     private var actionFinished = false
 
-    // v2.6.13 H2: back gesture = snooze (when snooze is available) or dismiss — NEVER
+    // v2.6.13 H2: back gesture = snooze (if snooze available) or dismiss — NEVER
     // silently stop the alarm via onDestroy.
     private val backCallback = object : androidx.activity.OnBackPressedCallback(true) {
         override fun handleOnBackPressed() {
@@ -91,7 +92,7 @@ class AlarmRingingActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         // v2.6.10: Simplified — ONLY showWhenLocked + turnScreenOn
-        // v2.6.10 FIX: requestDismissKeyguard() REMOVED — this can trigger the auth screen
+        // v2.6.10 FIX: requestDismissKeyguard() REMOVED — this can trigger an auth screen
         // "Show over lockscreen" != "Dismiss keyguard"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true)
@@ -110,10 +111,15 @@ class AlarmRingingActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
 
         alarmId = intent.getIntExtra(AlarmRepository.EXTRA_ALARM_ID, -1)
+        createdAt = android.os.SystemClock.elapsedRealtime()
 
         // v2.5.0: Read snooze settings (per-alarm override takes precedence)
-        val settingsRepo = io.github.calendaralarm.CalendarAlarmApp.settingsRepository
-        val globalSnooze = try { settingsRepo.getSnoozeMinutes() } catch (e: Exception) { 5 }
+        // B2 (review): via settingsRepository — snooze_minutes is written there.
+        // After B1 the regular prefs live in device-protected storage, so this is also
+        // readable before the first unlock (directBootAware).
+        val globalSnooze = try {
+            io.github.calendaralarm.CalendarAlarmApp.settingsRepository.getSnoozeMinutes()
+        } catch (e: Exception) { 5 }
 
         // Check for per-alarm snooze override
         val repo = AlarmRepository(this)
@@ -151,18 +157,19 @@ class AlarmRingingActivity : ComponentActivity() {
 
         AppLogger.i(TAG, "dispatchKeyEvent: action=$action keyCode=$keyCode (${KeyEvent.keyCodeToString(keyCode)})")
 
-        // Volume buttons — 3x within 2s = dismiss (only count DOWN, repeatCount==0)
+        // v2.7.0: Volume — one press = dismiss or snooze (setting "Hardware buttons").
+        // Previously 3x within 2s: unreliable half-asleep and not discoverable.
         if (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
             if (action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
-                handleVolumeButtonPress()
+                handleHardwareButton("volume")
             }
             return true // Consume both UP and DOWN so the volume does not change
         }
 
-        // Power button: log only (does not work reliably on Android 15 — system intercepts)
+        // Power button: log only (not reliable on Android 15 — system intercepts)
         if (keyCode == KeyEvent.KEYCODE_POWER) {
             AppLogger.i(TAG, "Power button event (action=$action) — possibly intercepted by system")
-            // Do NOT consume — let the system turn the screen off if applicable
+            // Do NOT consume — let the system turn the screen off where applicable
         }
 
         return super.dispatchKeyEvent(event)
@@ -175,31 +182,26 @@ class AlarmRingingActivity : ComponentActivity() {
      */
 
     /**
-     * v2.6.10: Volume button handler — 3 presses within 2 seconds dismisses the alarm.
-     * Uses SystemClock.elapsedRealtime() for accurate timing (GPT Sol recommendation).
+     * v2.7.0: Hardware button → snooze or dismiss according to setting (same rule as the
+     * power button in AlarmForegroundService).
      */
-    private fun handleVolumeButtonPress() {
-        val now = android.os.SystemClock.elapsedRealtime()
-        if (now - lastVolumePressTime > 2000) {
-            volumePressCount = 0 // Reset if too much time passed
+    private fun handleHardwareButton(source: String) {
+        if (hardwareHandled) return
+        val sinceOpen = android.os.SystemClock.elapsedRealtime() - createdAt
+        if (sinceOpen < 800) {
+            AppLogger.i(TAG, "Hardware button ($source) within guard (${sinceOpen}ms) — ignored")
+            return
         }
-        lastVolumePressTime = now
-        volumePressCount++
-        
-        AppLogger.i(TAG, "Volume button press #$volumePressCount")
-        
-        if (volumePressCount >= 3) {
-            // 3 presses within 2 seconds → dismiss alarm
-            AppLogger.i(TAG, "3 volume presses detected — dismissing alarm")
-            dismissAndFinish()
-            volumePressCount = 0
-        }
+        hardwareHandled = true
+        val action = OwnedAlarmReceiver.hardwareButtonAction(this, alarmId)
+        AppLogger.i(TAG, "Hardware button ($source) → $action")
+        if (action == OwnedAlarmReceiver.ACTION_SNOOZE) snoozeAndFinish() else dismissAndFinish()
     }
 
     override fun onResume() {
         super.onResume()
-        // v2.6.10 FIX (GPT Sol): NO requestDismissKeyguard() — this can trigger the auth screen
-        // "Show over lockscreen" leaves the device locked; "dismiss keyguard" asks for unlocking
+        // v2.6.10 FIX (GPT Sol): NO requestDismissKeyguard() — this can trigger an auth screen
+        // "Show over lockscreen" leaves the device locked; "dismiss keyguard" asks for unlock
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         // Re-apply immersive mode
@@ -225,13 +227,13 @@ class AlarmRingingActivity : ComponentActivity() {
     override fun onDestroy() {
         // v2.6.13 H2 FIX: onDestroy stops the alarm service ONLY on an explicit
         // user action (snoozeAndFinish/dismissAndFinish already called finish() + broadcast
-        // — those stop the service themselves in the receiver). On rotation, dark-mode switch,
+        // — those stop the service themselves in the receiver). On rotation, dark-mode change,
         // font/density change or back gesture (isChangingConfigurations=true) the
-        // service may NOT stop: the alarm must keep ringing. Otherwise the sound
+        // service must NOT stop: the alarm must keep ringing. Otherwise the sound
         // stops silently without snooze/dismiss.
         if (!isChangingConfigurations && !actionFinished) {
-            // Safety net: activity destroyed without an explicit action and NO config-change
-            // (e.g. system kill) — stop the service as a fallback.
+            // Safety net: activity destroyed without explicit action and no config change
+            // (e.g. system kill) — stop the service as a safety net.
             io.github.calendaralarm.service.AlarmForegroundService.stop(this)
         } else {
             AppLogger.i(TAG, "v2.6.13 H2 onDestroy: isChangingConfigurations=${isChangingConfigurations}, actionFinished=$actionFinished — service NOT stopped")
@@ -240,7 +242,9 @@ class AlarmRingingActivity : ComponentActivity() {
     }
 
     private fun snoozeAndFinish() {
-        actionFinished = true  // v2.6.13 H2: explicit action — onDestroy may not stop the service
+        actionFinished = true  // v2.6.13 H2: explicit action — onDestroy must not stop the service
+        // v2.7.0: stop sound immediately; not dependent on the broadcast round trip
+        io.github.calendaralarm.service.AlarmForegroundService.stop(this)
         if (alarmId != -1) {
             val intent = Intent(this, OwnedAlarmReceiver::class.java).apply {
                 action = OwnedAlarmReceiver.ACTION_SNOOZE
@@ -252,7 +256,10 @@ class AlarmRingingActivity : ComponentActivity() {
     }
 
     private fun dismissAndFinish() {
-        actionFinished = true  // v2.6.13 H2: explicit action — onDestroy may not stop the service
+        actionFinished = true  // v2.6.13 H2: explicit action — onDestroy must not stop the service
+        // v2.7.0: stop sound immediately — also when alarmId is missing (previously the
+        // alarm kept going: only finish(), and onDestroy stopped nothing because of actionFinished)
+        io.github.calendaralarm.service.AlarmForegroundService.stop(this)
         if (alarmId != -1) {
             val intent = Intent(this, OwnedAlarmReceiver::class.java).apply {
                 action = OwnedAlarmReceiver.ACTION_DISMISS
@@ -265,6 +272,8 @@ class AlarmRingingActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
+        hardwareHandled = false
         val newId = intent.getIntExtra(AlarmRepository.EXTRA_ALARM_ID, -1)
         if (newId != -1 && newId != alarmId) {
             alarmId = newId
@@ -366,13 +375,14 @@ fun AlarmRingingScreen(
             }
 
             // v2.6.10 FIX (GPT Sol): Hint text adjusted — Power button does NOT work on Android 15
-            // (system intercepts KEYCODE_POWER before dispatching to the app)
+            // (system intercepts KEYCODE_POWER before dispatch to the app)
             Spacer(modifier = Modifier.height(16.dp))
+            val hwAction = remember { OwnedAlarmReceiver.hardwareButtonAction(context, alarmId) }
             Text(
-                text = if (snoozeAvailable) {
-                    "Tap Snooze · 3x volume button = dismiss"
+                text = if (hwAction == OwnedAlarmReceiver.ACTION_SNOOZE) {
+                    "Volume or power button = snooze"
                 } else {
-                    "Tap Dismiss · 3x volume button = dismiss"
+                    "Volume or power button = dismiss"
                 },
                 fontSize = 12.sp,
                 color = Color(0xFF8E8E93).copy(alpha = 0.7f)

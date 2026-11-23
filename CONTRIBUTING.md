@@ -19,6 +19,11 @@ reviews may take a while — but issues and PRs are welcome.
 ## Development setup
 
 ```bash
+# Hard gate (required before every push): app unit tests + assembleDebug (+ assembleRelease
+# when a keystore is configured) + server pytest — must print RESULTAAT: GROEN
+tools/verify.sh
+
+# Or run the parts manually:
 # App
 cd android
 cp gradle.properties.template gradle.properties
@@ -37,6 +42,10 @@ python -m pytest -q
 - Update `CHANGELOG.md` if the change is user-visible.
 - Update or add docs under `docs/` when behavior, config or the API changes.
 - Add/adjust unit tests for logic changes (`android/app/src/test/...`, `server/tests/...`).
+- **Pre-push gate**: run `tools/verify.sh` before pushing — it is a hard gate (app unit
+  tests + `assembleDebug` + server pytest; release builds add `assembleRelease`). It must
+  end with `RESULTAAT: GROEN`; a skipped step (e.g. no keystore in a worktree) requires
+  `ALLOW_SKIP=1` and is never release-worthy.
 - CI must pass: gitleaks + `tools/sanitize-check.sh`, server pytest, Android unit tests +
   debug build.
 - Never modify secrets handling to make things "easier" — tokens stay in

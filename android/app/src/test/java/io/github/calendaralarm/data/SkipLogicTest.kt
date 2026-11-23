@@ -19,7 +19,7 @@ import org.junit.Assert.assertTrue
  * F7 + F5: Unit tests for skip logic.
  *
  * Tests the skipCount lifecycle:
- * 1. User taps "Skip deze keer" → skipCount incremented
+ * 1. User taps "Skip this time" → skipCount incremented
  * 2. Next schedule attempt → skipCount decremented, alarm NOT scheduled for today
  * 3. Alarm scheduled for next matching day instead
  * 4. Server sync (replaceForDate) → skipCount reset to 0
@@ -35,6 +35,7 @@ class SkipLogicTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
         context.getSharedPreferences("calendar_alarm_store", Context.MODE_PRIVATE)
             .edit().clear().commit()
+        io.github.calendaralarm.data.DeviceProtectedStorage.prefs(context, "calendar_alarm_store").edit().clear().commit()
         store = AlarmStore(context)
     }
 
@@ -63,7 +64,7 @@ class SkipLogicTest {
         )
     }
 
-    // ============== Skip increment (user taps "Skip deze keer") ==============
+    // ============== Skip increment (user taps "Skip this time") ==============
 
     @Test
     fun `skip increments skipCount from 0 to 1`() {

@@ -21,15 +21,15 @@ import org.robolectric.shadows.ShadowApplication
 
 /**
  * v2.6.13 H2 (HIGH, ARCHITECT-REVIEW-2026-11-12 §B2): `AlarmRingingActivity.onDestroy()`
- * stopte de alarm-foreground-service AL bij rotatie/config-change/back — het alarm ging
- * stil zonder snooze/dismiss.
+ * stopped the alarm foreground service on EVERY rotation/config-change/back — the alarm
+ * went silent without snooze/dismiss.
  *
- * Fix: onDestroy stopt de service ALLEEN als er geen expliciete gebruikersactie was
- * EN het géén config-change is. Back-gesture = snooze (of dismiss) via OnBackPressedCallback.
+ * Fix: onDestroy stops the service ONLY if there was no explicit user action
+ * AND it is not a config-change. Back gesture = snooze (or dismiss) via OnBackPressedCallback.
  *
- * Deze tests bewijzen met ActivityScenario.recreate() (simuleert rotatie/config-change)
- * dat de stop-service intent NIET wordt verstuurd. We meten via ShadowApplication's
- * `nextStoppedServiceIntent` (consumeerbaar) zodat we de stop-intents kunnen tellen.
+ * These tests prove with ActivityScenario.recreate() (simulates rotation/config-change)
+ * that the stop-service intent is NOT sent. We measure via ShadowApplication's
+ * `nextStoppedServiceIntent` (consumable) so we can count the stop intents.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [26])
@@ -41,6 +41,7 @@ class AlarmRingingActivityLifecycleTest {
     fun setUp() {
         context = ApplicationProvider.getApplicationContext()
         context.getSharedPreferences("calendar_alarm_store", Context.MODE_PRIVATE).edit().clear().commit()
+        io.github.calendaralarm.data.DeviceProtectedStorage.prefs(context, "calendar_alarm_store").edit().clear().commit()
     }
 
     @After
@@ -51,7 +52,7 @@ class AlarmRingingActivityLifecycleTest {
     private fun shadowApp(): ShadowApplication =
         shadowOf(ApplicationProvider.getApplicationContext<Application>())
 
-    /** Aantal stop-intents voor AlarmForegroundService dat tot nu toe is verstuurd. */
+    /** Number of stop intents for AlarmForegroundService sent so far. */
     private fun drainStopServiceIntents(): Int {
         val shadow = shadowOf(ApplicationProvider.getApplicationContext<Application>())
         var count = 0
@@ -63,7 +64,7 @@ class AlarmRingingActivityLifecycleTest {
     }
 
     private fun launchRinging(alarmId: Int): ActivityScenario<AlarmRingingActivity> {
-        // Seed een alarm zodat de activity z'n state kan lezen
+        // Seed an alarm so the activity can read its state
         AlarmStore(context).save(
             AlarmStore.OwnedAlarm(
                 id = alarmId,
@@ -82,15 +83,15 @@ class AlarmRingingActivityLifecycleTest {
 
     @Test
     fun `H2 recreate (rotatie config-change) does NOT stop the alarm service`() {
-        drainStopServiceIntents() // wis historisch
+        drainStopServiceIntents() // clear history
 
         launchRinging(1).use { scenario ->
-            // Simuleer rotatie / config-change → activity wordt gerecreate
+            // Simulate rotation / config-change → activity gets recreated
             scenario.recreate()
 
             val stops = drainStopServiceIntents()
             assertEquals(
-                "H2: recreate (config-change) mag de alarm-service NIET stoppen — het alarm moet blijven rinkelen",
+                "H2: recreate (config-change) must NOT stop the alarm service — the alarm must keep ringing",
                 0, stops
             )
         }
@@ -101,12 +102,12 @@ class AlarmRingingActivityLifecycleTest {
         drainStopServiceIntents() // wis historisch
 
         val scenario = launchRinging(1)
-        // Gewone destroy (geen recreate, geen actie, isChangingConfigurations=false) → vangnet
+        // Plain destroy (no recreate, no action, isChangingConfigurations=false) → safety net
         scenario.close()
 
         val stops = drainStopServiceIntents()
         assertTrue(
-            "H2: plain destroy zonder actie en zonder config-change moet de service als vangnet stoppen",
+            "H2: plain destroy without action and without config-change must stop the service as safety net",
             stops >= 1
         )
     }

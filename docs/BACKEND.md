@@ -151,8 +151,8 @@ not care how the initial token was obtained — only the file format matters.
   "scope": "Calendars.Read offline_access",
   "expires_in": 3600,
   "ext_expires_in": 3600,
-  "access_token": "eyJ0eXAiOiJKV1QiLCJhbGciOi...",
-  "refresh_token": "0.ATcA...",
+  "access_token": "<access-token>",
+  "refresh_token": "<refresh-token>",
   "expires_at": 1763400000
 }
 ```

@@ -33,9 +33,17 @@ app.
    tools/sanitize-check.sh --history
    ```
    Both must print `sanitize-check: CLEAN`.
-4. Run the server tests: `cd server && pip install -r requirements.txt -r requirements-dev.txt && python -m pytest -q`
-5. Run the Android unit tests: `cd android && cp gradle.properties.template gradle.properties && ./gradlew :app:testDebugUnitTest`
-6. Commit and push to `main`; CI (`.github/workflows/ci.yml`) runs gitleaks +
+4. Run the **hard verification gate** — this is the required pre-push/pre-release check
+   (it runs the Android unit tests, `:app:assembleDebug`, `:app:assembleRelease` when a
+   keystore is configured, and the server pytest suite, and fails on any failure):
+   ```bash
+   tools/verify.sh
+   # must end with: RESULTAAT: GROEN  (ALLOW_SKIP=1 is for worktree checks only,
+   # never for a release)
+   ```
+   To run just the parts manually: `cd server && pip install -r requirements.txt -r requirements-dev.txt && python -m pytest -q`
+   and `cd android && cp gradle.properties.template gradle.properties && ./gradlew :app:testDebugUnitTest :app:assembleDebug`
+5. Commit and push to `main`; CI (`.github/workflows/ci.yml`) runs gitleaks +
    sanitize-check + server tests + Android build/tests.
 
 ## 2. Tag and push → release workflow
@@ -75,8 +83,9 @@ Pushing the tag triggers `.github/workflows/release.yml`, which:
 |----------|---------|
 | `CALALARM_APPLICATION_ID` | override `applicationId` (default `io.github.calendaralarm`) |
 | `CALALARM_API_URL` | default backend URL baked into the app (use your own host, e.g. `https://alarm-api.example.com`) |
-| `CALALARM_UPDATE_SERVER_URL` | base URL of the self-hosted update feed (see §3). Empty = in-app updater disabled. |
-| `CALALARM_CERT_PINS` | comma-separated base64 SPKI SHA-256 pins for TLS certificate pinning (empty = system CA validation only) |
+| `CALALARM_UPDATE_SERVER_URL` | base URL of the self-hosted update feed (see §3). The in-app updater is only active when this **and** `CALALARM_UPDATE_SIGNER_SHA256` are set (fail-closed) |
+| `CALALARM_UPDATE_SIGNER_SHA256` | hex SHA-256 of the release signing certificate; every downloaded APK is verified against it. Required to enable the in-app updater |
+| `CALALARM_CERT_PINS` | comma-separated base64 SPKI SHA-256 pins for TLS certificate pinning. Empty (default) = the built-in public-CA root pin set (ISRG, GTS, SSL.com, GlobalSign); set only for a private CA. Reproduce with `tools/compute_pins.sh` |
 
 The workflow passes these to Gradle as `ORG_GRADLE_PROJECT_*` environment
 variables; nothing personal is hardcoded in the repo.
@@ -125,6 +134,7 @@ app's signer. Publish `SHA256SUMS` alongside for manual verification.
 ## 4. Pre-publish checklist (make the GitHub repo public)
 
 - [ ] `tools/sanitize-check.sh` and `--history` both print `CLEAN`
+- [ ] `tools/verify.sh` prints `RESULTAAT: GROEN` (unit tests + assembleDebug [+ assembleRelease] + server pytest all pass — hard gate, no skips for a release)
 - [ ] `git log -p --all` reviewed — no personal data in history (if there is,
   rewrite history *before* publishing, e.g. with `git filter-repo`)
 - [ ] **Secret scanning** enabled (Settings → Code security and analysis →

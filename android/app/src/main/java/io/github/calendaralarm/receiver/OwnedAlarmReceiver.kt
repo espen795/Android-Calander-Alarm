@@ -7,6 +7,8 @@ import android.content.Intent
 import android.os.Build
 import android.os.PowerManager
 import io.github.calendaralarm.data.AlarmRepository
+import io.github.calendaralarm.data.AlarmStore
+import io.github.calendaralarm.data.AlarmTransactions
 import io.github.calendaralarm.data.AppLogger
 import io.github.calendaralarm.service.AlarmForegroundService
 import io.github.calendaralarm.ui.AlarmRingingActivity
@@ -38,12 +40,48 @@ class OwnedAlarmReceiver : BroadcastReceiver() {
          * F6: Get the configured snooze duration in minutes from settings.
          */
         fun getSnoozeMinutes(context: Context): Long {
+            // B2 (review): read via settingsRepository — snooze_minutes is written
+            // there (calendar_alarm_settings, DP since B1 → readable before unlock).
+            // The earlier direct read from "alarm_settings" read a different file → always 5.
             return try {
                 io.github.calendaralarm.CalendarAlarmApp.settingsRepository.getSnoozeMinutes().toLong()
             } catch (e: Exception) {
-                AppLogger.w(TAG, "Failed to read snooze minutes from settings, using default")
-                DEFAULT_SNOOZE_MINUTES
+                // Fallback: direct from DP regular prefs (if settingsRepository is not
+                // initialized, e.g. in a receiver before Application.onCreate)
+                try {
+                    io.github.calendaralarm.data.DeviceProtectedStorage.prefs(
+                        context, "calendar_alarm_settings"
+                    ).getInt("snooze_minutes", DEFAULT_SNOOZE_MINUTES.toInt()).toLong()
+                } catch (e2: Exception) {
+                    AppLogger.w(TAG, "Failed to read snooze minutes, using default")
+                    DEFAULT_SNOOZE_MINUTES
+                }
             }
+        }
+
+        /**
+         * v2.7.0: Effective snooze duration for an alarm — the per-alarm override takes precedence over the
+         * global setting (same rule as AlarmRingingActivity shows). 0 = snooze off.
+         */
+        fun effectiveSnoozeMinutes(context: Context, alarm: io.github.calendaralarm.data.AlarmStore.OwnedAlarm?): Long {
+            return alarm?.snoozeMinutesOverride?.toLong() ?: getSnoozeMinutes(context)
+        }
+
+        /**
+         * v2.7.0: Which action a physical button (volume / power) performs while ringing.
+         * Setting "dismiss" (default) or "snooze"; snooze falls back to dismiss if snooze
+         * is off for this alarm.
+         */
+        fun hardwareButtonAction(context: Context, alarmId: Int): String {
+            val pref = io.github.calendaralarm.data.DeviceProtectedStorage.prefs(
+                context, io.github.calendaralarm.CalendarAlarmApp.PREFS_ALARM_SETTINGS  // P1 #1: DP
+            ).getString(
+                io.github.calendaralarm.CalendarAlarmApp.PREF_HARDWARE_BUTTON_ACTION,
+                io.github.calendaralarm.CalendarAlarmApp.HARDWARE_ACTION_DISMISS
+            )
+            if (pref != io.github.calendaralarm.CalendarAlarmApp.HARDWARE_ACTION_SNOOZE) return ACTION_DISMISS
+            val alarm = try { AlarmRepository(context).store.get(alarmId) } catch (_: Exception) { null }
+            return if (effectiveSnoozeMinutes(context, alarm) > 0) ACTION_SNOOZE else ACTION_DISMISS
         }
     }
 
@@ -63,45 +101,76 @@ class OwnedAlarmReceiver : BroadcastReceiver() {
     }
 
     private fun handleAlarmFired(context: Context, alarmId: Int) {
+        // P2B re-review B3: the service start is requested before the store mutations and
+        // does not depend on store code that can fail; the mutations are in try/catch so that
+        // an error there does not crash the receiver (and thus the service).
+        // NB: onStartCommand (sound) only runs after onReceive is done (both main
+        // thread) — the sound therefore waits briefly (ms, no network inside the lock) for the
+        // mutations. Do NOT move to a background thread (goAsync): then a
+        // quick dismiss could arrive before the re-arm and break the repeat chain.
+        var label = "Alarm"
+        var timeLabel = nowTimeLabel()
+        try {
+            val stored = AlarmRepository(context).store.get(alarmId)
+            if (stored != null) {
+                label = stored.label
+                timeLabel = stored.timeLabel
+            } else {
+                AppLogger.e(TAG, "P1 review#3: Alarm $alarmId not found in store — RING ANYWAY (fail-safe) with default label")
+            }
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "B3: reading the store failed before ringing (${e.message}) — RING ANYWAY with default label")
+        }
+        try {
+            val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+            powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CalendarAlarm:AlarmWakeLock")
+                .acquire(30_000)
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "B3: receiver wakelock failed (${e.message}) — service takes its own wakelock")
+        }
+        // The service's startForeground() with setFullScreenIntent() is THE only fullscreen trigger
+        AlarmForegroundService.start(context, alarmId, timeLabel, label)
+
+        try {
+            AlarmTransactions.run { handleAlarmFiredLocked(context, alarmId) }
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "B3: store mutations after firing failed (${e.message}) — alarm still rings")
+        }
+    }
+
+    private fun nowTimeLabel(): String = try {
+        java.time.Instant.ofEpochMilli(io.github.calendaralarm.data.AppClock.now())
+            .atZone(java.time.ZoneId.systemDefault())
+            .format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"))
+    } catch (e: Exception) { "nu" }
+
+    /** Store mutations after firing (under AlarmTransactions). Does NOT start a service — that already happened. */
+    private fun handleAlarmFiredLocked(context: Context, alarmId: Int) {
         AppLogger.i(TAG, "v2.6.10: handleAlarmFired() called — alarmId=$alarmId")
-        android.widget.Toast.makeText(context, "⏰ ALARM FIRING! (id=$alarmId)", android.widget.Toast.LENGTH_LONG).show()
-        
+
         val repo = AlarmRepository(context)
-        val alarm = repo.store.get(alarmId)
-        if (alarm == null) {
-            AppLogger.w(TAG, "v2.6.10: Alarm $alarmId not found in store")
-            android.widget.Toast.makeText(context, "❌ Alarm not found in store!", android.widget.Toast.LENGTH_LONG).show()
+        val stored = repo.store.get(alarmId) ?: run {
+            // Fallback alarm (no record): already ringing; nothing to save or re-arm.
+            AppLogger.i(TAG, "P1 review#3: fallback alarm $alarmId — no store mutations")
             return
         }
-        AppLogger.i(TAG, "v2.6.10: Alarm found: ${alarm.timeLabel} - ${alarm.label}")
-
-        // Wake lock so device stays awake (backup — service also has a wake lock)
-        // v2.6.9 FIX: Remove ACQUIRE_CAUSES_WAKEUP and ON_AFTER_RELEASE — incompatible with PARTIAL_WAKE_LOCK
-        val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
-        val wakeLock = powerManager.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "CalendarAlarm:AlarmWakeLock"
-        )
-        wakeLock.acquire(30_000) // 30 seconds
-
-        // v2.6.10 FIX (GPT Sol): ONE FSI notification via foreground service
-        // Removed: showAlarmRingingNotification() — this was a SECOND FSI notification (conflict!)
-        // Removed: launchRingingActivity() — direct start blocks/complicates FSI
-        // The service's startForeground() with setFullScreenIntent() is THE only fullscreen trigger
-        AlarmForegroundService.start(context, alarmId, alarm.timeLabel, alarm.label)
-
-        // v2.6.10: NO separate ringing notification anymore — the service notification already has FSI
-        // v2.6.10: NO direct activity launch anymore — let FSI do the work
+        val alarm: AlarmStore.OwnedAlarm = stored
+        AppLogger.i(TAG, "v2.6.10: Alarm found: ${alarm.timeLabel} - ${alarm.label} (store)")
 
         // NC-02 fix: Do NOT remove the fired alarm. Mark as disabled (ringing state).
-        repo.store.save(alarm.copy(enabled = false))
+        // P1 review#3: if the record was missing (fallback alarm), we do NOT save it —
+        // we don't want to create a ghost record in the store that could later be
+        // snoozed/dismissed as a "real" alarm. We only mark existing records.
+        if (repo.store.get(alarmId) != null) {
+            repo.store.save(alarm.copy(enabled = false))
+        }
 
         // v2.6.13 C1 + C1b + H7 fix: re-arm the next occurrence for repeat alarms.
         // - C1: the guard `skipCount == 0` has been REMOVED. A skip is consumed in
-        //   PreAlarmReceiver.handleSkip (the record moves directly to the next
+        //   PreAlarmReceiver.handleSkip (the record immediately shifts to the next
         //   occurrence with skipCount=0), so skipCount > 0 here would block the chain.
-        //   After a skip the next occurrence MUST re-arm.
-        // - C1b: originalTriggerMillis = nextTrigger (not the old T0), so a dismiss
+        //   After a skip, the next occurrence MUST re-arm.
+        // - C1b: originalTriggerMillis = nextTrigger (not the old T0), so that a dismiss
         //   of a snooze does not cancel the whole repeat chain (see handleDismiss).
         // - H7: on a snooze (isSnooze=true) NO re-arm — the re-arm was already done at
         //   the original firing; an extra re-arm would duplicate the alarm.
@@ -116,11 +185,11 @@ class OwnedAlarmReceiver : BroadcastReceiver() {
                     date = nextDate,
                     enabled = true,
                     isSnooze = false,
-                    skipCount = 0,  // v2.6.13 C1: skip already consumed when shifting
+                    skipCount = 0,  // v2.6.13 C1: skip was already consumed when shifting
                     originalTriggerMillis = nextTrigger.toEpochMilli()  // v2.6.13 C1b: new chain anchor
                 )
                 // v2.6.13 L3: automatic re-arm after firing is a system event → force=true (silent).
-                // Without force, every morning would show an "Alarm changed" for an unchanged repeat alarm.
+                // Without force, every morning produced an "Alarm changed" for an unchanged repeat alarm.
                 val scheduled = repo.schedule(nextAlarm, force = true)
                 if (scheduled != null) {
                     AppLogger.i(TAG, "v2.6.13 C1/C1b/H7 Repeat alarm: scheduled next occurrence id=${nextAlarm.id} for $nextDate at ${alarm.timeLabel} (orig=${nextAlarm.originalTriggerMillis})")
@@ -178,6 +247,11 @@ class OwnedAlarmReceiver : BroadcastReceiver() {
     }
 
     private fun handleSnooze(context: Context, alarmId: Int) {
+        // P2B review#9: snooze chain (get → schedule snooze → remove old) atomic.
+        AlarmTransactions.run { handleSnoozeLocked(context, alarmId) }
+    }
+
+    private fun handleSnoozeLocked(context: Context, alarmId: Int) {
         // v2.5.7 Story 3: Snooze is ALWAYS allowed — it's a response to an active alarm,
         // not a schedule change. Blocking snooze would trap the user with a ringing alarm.
         // The freeze prevents schedule changes (create/edit/delete), not alarm responses.
@@ -185,17 +259,39 @@ class OwnedAlarmReceiver : BroadcastReceiver() {
         // v2.5.7 Story 1: Stop the foreground service (stops sound, vibration, wake lock)
         AlarmForegroundService.stop(context)
 
-        val alarm = repo.store.get(alarmId)
+        var alarm = repo.store.get(alarmId)
 
         if (alarm == null) {
-            AppLogger.w(TAG, "Cannot snooze: alarm $alarmId not found")
-            io.github.calendaralarm.service.AlarmNotificationHelper.cancelAlarmRingingNotification(context, alarmId)
-            return
+            // B4 (review): snooze on a fallback alarm (fire without record, see #3)
+            // must NOT permanently disable the alarm — still schedule a snooze with a
+            // new id, same fail-safe fallback object as handleAlarmFired.
+            AppLogger.w(TAG, "B4: snooze without store record for id=$alarmId — still scheduling snooze (fail-safe)")
+            val now = io.github.calendaralarm.data.AppClock.now()
+            val nowLabel = try {
+                java.time.LocalTime.now(java.time.ZoneId.systemDefault())
+                    .format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"))
+            } catch (e: Exception) { "nu" }
+            alarm = AlarmStore.OwnedAlarm(
+                id = alarmId,
+                triggerAtMillis = now,
+                timeLabel = nowLabel,
+                label = "Alarm",
+                date = java.time.Instant.ofEpochMilli(io.github.calendaralarm.data.AppClock.now()).atZone(java.time.ZoneId.systemDefault()).toLocalDate().toString(),
+                type = "manual",
+                enabled = true,
+                originalTriggerMillis = now
+            )
         }
 
-        // F6: Read snooze duration from settings
-        val snoozeMinutes = getSnoozeMinutes(context)
-        val snoozeTrigger = System.currentTimeMillis() + snoozeMinutes * 60_000
+        // v2.7.0: respect the per-alarm override (previously always the global value, while
+        // the ringing screen showed the override). Snooze off (0) → treat as dismiss.
+        val snoozeMinutes = effectiveSnoozeMinutes(context, alarm)
+        if (snoozeMinutes <= 0) {
+            AppLogger.i(TAG, "Snooze off for alarm $alarmId — dismiss instead of snooze")
+            handleDismiss(context, alarmId)  // reentrant: already inside the lock
+            return
+        }
+        val snoozeTrigger = io.github.calendaralarm.data.AppClock.now() + snoozeMinutes * 60_000
         val snoozed = alarm.copy(
             id = repo.store.nextId(),
             triggerAtMillis = snoozeTrigger,
@@ -208,7 +304,9 @@ class OwnedAlarmReceiver : BroadcastReceiver() {
         // v2.5.7 Story 3: Use force=true — snooze must work even during freeze (safety)
         val scheduled = repo.schedule(snoozed, force = true)
         if (scheduled != null) {
-            repo.store.remove(alarmId)
+            // B4: only remove the old record if it DID exist (with a fallback
+            // there was no record — removing a non-existent one is a no-op, but log it)
+            if (repo.store.get(alarmId) != null) repo.store.remove(alarmId)
             AppLogger.i(TAG, "Snoozed: id=$alarmId → ${snoozed.id} (${snoozeMinutes} min)")
         } else {
             AppLogger.e(TAG, "Failed to schedule snooze — keeping original entry")
@@ -218,6 +316,11 @@ class OwnedAlarmReceiver : BroadcastReceiver() {
     }
 
     private fun handleDismiss(context: Context, alarmId: Int) {
+        // P2B review#9: dismiss chain (get → cancel → snooze cascade) atomic.
+        AlarmTransactions.run { handleDismissLocked(context, alarmId) }
+    }
+
+    private fun handleDismissLocked(context: Context, alarmId: Int) {
         // v2.5.7 Story 3: Dismiss is ALWAYS allowed — safety-critical operation.
         // Blocking dismiss during freeze would trap the user with a ringing alarm.
         // The freeze is meant to prevent accidental SCHEDULE changes, not to prevent
@@ -233,15 +336,15 @@ class OwnedAlarmReceiver : BroadcastReceiver() {
             repo.cancel(alarmId, force = true)
             // v2.6.13 C1b FIX: the cancel cascade now filters on isSnooze == true, so ONLY
             // snooze records with the same originalTriggerMillis are cancelled — NOT the
-            // already re-armed occurrences of next week. Before this fix every re-arm had
-            // originalTriggerMillis = T0 (the old one), so dismiss of a snooze wiped the ENTIRE
+            // already re-armed occurrences of next week. Before this fix every re-arm
+            // had originalTriggerMillis = T0 (the old one), so dismissing a snooze wiped the WHOLE
             // repeat chain. Now originalTriggerMillis at the re-arm = nextTrigger
             // (see handleAlarmFired), but the extra filter is defense-in-depth.
             if (alarm.isSnooze) {
                 repo.store.getAll()
                     .filter { it.isSnooze && it.originalTriggerMillis == alarm.originalTriggerMillis && it.id != alarmId }
                     .forEach { repo.cancel(it.id, force = true) }
-                AppLogger.i(TAG, "v2.6.13 C1b: dismiss of snooze id=$alarmId cancels only snooze cascades (orig=${alarm.originalTriggerMillis})")
+                AppLogger.i(TAG, "v2.6.13 C1b: dismiss of snooze id=$alarmId only cancels snooze cascades (orig=${alarm.originalTriggerMillis})")
             }
         } else {
             repo.cancel(alarmId, force = true) // best effort even if not in store

@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.security.MessageDigest
 import java.security.SecureRandom
+// AppClock is in the same package (io.github.calendaralarm.data) — no import needed
 
 /**
  * Settings & secure token storage.
@@ -52,42 +53,97 @@ class SettingsRepository(private val context: Context) {
         private const val KEY_WAKKER_FREEZE_END = "wakker_freeze_end"
     }
 
-    /**
-     * True only when EncryptedSharedPreferences initialized successfully.
-     * When false, the API server must not start (fail closed) — but user settings still work.
-     */
-    val secureStorageAvailable: Boolean
-    private val securePrefs: SharedPreferences?
-
     // v2.5.10: Regular SharedPreferences for non-sensitive settings (always available)
-    private val regularPrefs: SharedPreferences = context.getSharedPreferences(REGULAR_PREFS_FILE, Context.MODE_PRIVATE)
+    // P1 review#1/B1: in device-protected storage — the non-secret settings
+    // (snooze_minutes, freeze, server_url, wake times, auto_update) must be readable before
+    // the first unlock. NB: REGULAR_PREFS_FILE = "calendar_alarm_settings"
+    // is NOT the same file as CalendarAlarmApp.PREFS_ALARM_SETTINGS ("alarm_settings")
+    // — the latter contains the ring options (volume/vibration/sound/hardware button).
+    private val regularPrefs: SharedPreferences =
+        DeviceProtectedStorage.prefs(context, REGULAR_PREFS_FILE)
 
     init {
-        var prefs: SharedPreferences? = null
-        var available = false
-        try {
+        initSecurePrefs()
+    }
+
+    /**
+     * N-a (review): initialize EncryptedSharedPreferences (CE). During locked boot
+     * (before the first unlock) CE is unavailable → securePrefs=null.
+     * After unlock this is called again (via UserUnlockReceiver or lazy on
+     * first use if isUserUnlocked) so tokens/CF credentials work anyway.
+     */
+    @Synchronized
+    private fun initSecurePrefs(): Boolean {
+        // NB: no `securePrefs != null` check here — that property has a getter that
+        // itself calls initSecurePrefs() → infinite recursion. Always check the backing field.
+        if (securePrefsField != null) return true
+        // Only try if the user is unlocked — during locked boot this intentionally fails
+        // (CE not readable) and we do not log a false CRITICAL.
+        if (!DeviceProtectedStorage.isUserUnlocked(context)) {
+            Log.i(TAG, "N-a: user locked — secure prefs deferred until after unlock")
+            secureStorageAvailableField = false
+            return false
+        }
+        return try {
             val app = context.applicationContext
             val key = MasterKey.Builder(app)
                 .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
                 .build() // propagate Keystore error — NO fallback
-            prefs = EncryptedSharedPreferences.create(
+            val p = EncryptedSharedPreferences.create(
                 app,
                 SECURE_PREFS_FILE,
                 key,
                 EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
                 EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
             )
-            available = true
+            securePrefsField = p
+            secureStorageAvailableField = true
             Log.i(TAG, "Secure storage initialized successfully")
+            true
         } catch (e: Exception) {
             // FAIL CLOSED for secure storage: tokens/CF credentials unavailable
             // But regular settings still work (v2.5.10 fix)
             Log.e(TAG, "Secure storage initialization failed — tokens/CF creds disabled, but user settings still work")
-            prefs = null
-            available = false
+            securePrefsField = null
+            secureStorageAvailableField = false
+            false
         }
-        securePrefs = prefs
-        secureStorageAvailable = available
+    }
+
+    // N-a: mutable backing fields so secure prefs lazily re-init after unlock
+    private var securePrefsField: SharedPreferences? = null
+    private var secureStorageAvailableField: Boolean = false
+
+    private val securePrefs: SharedPreferences?
+        get() {
+            // Lazy re-init after unlock (N-a): if the backing field is null AND the user
+            // has meanwhile unlocked, try to initialize CE again.
+            if (securePrefsField == null && DeviceProtectedStorage.isUserUnlocked(context)) {
+                initSecurePrefs()
+            }
+            return securePrefsField
+        }
+
+    val secureStorageAvailable: Boolean
+        get() {
+            // N-a: after ACTION_USER_UNLOCKED (or lazy on first use) CE is
+            // still initialized as soon as the user is unlocked.
+            if (!secureStorageAvailableField && DeviceProtectedStorage.isUserUnlocked(context)) {
+                initSecurePrefs()
+            }
+            return secureStorageAvailableField
+        }
+
+    /**
+     * N-a: explicit re-initialization after ACTION_USER_UNLOCKED (UserUnlockReceiver).
+     * Forces a new attempt if the previous init during locked boot failed.
+     * @return true if secure prefs are now available.
+     */
+    @Synchronized
+    fun reinitSecurePrefsAfterUnlock(): Boolean {
+        if (securePrefsField != null) return true
+        secureStorageAvailableField = false
+        return initSecurePrefs()
     }
 
     private val _settings = MutableStateFlow(loadSettings())
@@ -200,8 +256,10 @@ class SettingsRepository(private val context: Context) {
      */
     fun isWekkerFrozen(): Boolean {
         if (!isWekkerFreezeEnabled()) return false
-        val now = java.util.Calendar.getInstance()
-        val currentMinutes = now.get(java.util.Calendar.HOUR_OF_DAY) * 60 + now.get(java.util.Calendar.MINUTE)
+        // P2A minor (Opus review): AppClock-based so freeze is testable via FixedClock
+        val cal = java.util.Calendar.getInstance()
+        cal.timeInMillis = AppClock.now()
+        val currentMinutes = cal.get(java.util.Calendar.HOUR_OF_DAY) * 60 + cal.get(java.util.Calendar.MINUTE)
 
         val startParts = getWekkerFreezeStart().split(":")
         val endParts = getWekkerFreezeEnd().split(":")
@@ -298,7 +356,7 @@ class SettingsRepository(private val context: Context) {
     }
 
     /**
-     * Set a user-provided device token (e.g. copied from the backend server config).
+     * Set a user-provided device token (e.g. copied from the the server server config).
      * The server must have this exact token configured.
      * Stored in EncryptedSharedPreferences (SECURE).
      */

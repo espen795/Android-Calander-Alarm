@@ -11,6 +11,36 @@ household terms), manual review of auth/crypto/update paths, YAML validation,
 Only `example.com` / `example.org` style placeholders are used throughout;
 no personal data appears in this document.
 
+## 0. v2.8.0 changes (2026-11-23)
+
+Short summary of the security-relevant changes shipped in v2.8.0 (versionCode 66);
+the sections below still describe the 2026-11-18 audit baseline.
+
+- **Heartbeat endpoints** — `POST /api/heartbeat` and `GET /api/heartbeat/status` with a
+  dedicated read-only `CALALARM_MONITOR_TOKEN` (constant-time compare, empty = disabled) that
+  can only read the status verdict — never post or read config. Strict pydantic validation
+  (formats, ≤ 50 entries, ≤ 64 KB), labels accepted but never stored, validation errors
+  return field names only, atomic write with mode 600.
+- **Per-host certificate pinning** — every HTTPS client gets its own trust manager bound
+  to one fixed host (removes a shared-mutable-host race between concurrent workers).
+  `ACTIVE_PINS` defaults to root pins of ISRG, GTS, SSL.com and GlobalSign; hostname
+  verification (SAN/CN, wildcard only as left-most label) is **always** enforced.
+  `CALALARM_CERT_PINS` replaces the set (private CAs). Only the update channel may fall
+  back to system trust on a pure pin mismatch (never on hostname/network errors); sync,
+  heartbeat and log upload fail closed. `tools/compute_pins.sh` reproduces the pins.
+- **Fail-closed updater** — active only when both `CALALARM_UPDATE_SERVER_URL` and a valid
+  64-hex `CALALARM_UPDATE_SIGNER_SHA256` are set; every APK is verified by SHA-256 + exact
+  size + pinned signer (constant-time) before any install intent.
+- **Direct boot** — the alarm path moved to device-protected storage (readable pre-unlock);
+  secrets stay in credential-encrypted storage and are re-initialized on `USER_UNLOCKED`.
+- **Server/container** — blocking MS token refresh + calendar fetch run in a threadpool
+  with an in-memory token cache under a lock; calendar windows converted to true UTC;
+  last-known-good plan cache per date (mode 600); container drops all capabilities,
+  `no-new-privileges`, mem/PID limits, Python-only healthcheck, and
+  `FORWARDED_ALLOW_IPS` so uvicorn trusts `X-Forwarded-For` only from the proxy IP.
+- **Process gate** — `tools/verify.sh` (app unit tests + `assembleDebug` [+ release] +
+  server pytest) is the required pre-push/pre-release gate.
+
 ## 1. Sanitization findings
 
 | # | Severity | File:line | Finding | Status |
